@@ -7,3 +7,4 @@ tests/test_text_search
 tests/test_undo_stack
 tests/test_marks
 tests/test_directory_tracking
+tests/test_terminal_launch
