@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+shell_sheet
+tests/test_syntax_highlight
+tests/test_text_transforms
+tests/test_text_search
+tests/test_undo_stack
+tests/test_marks
+tests/test_directory_tracking
