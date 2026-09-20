@@ -602,6 +602,14 @@ void ShellSheet::setup_menu() {
     m_item_terminal->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_terminal));
     terminal_menu->append(*m_item_terminal);
 
+    // Shortcut lives in the label because it is handled in on_key_press()
+    // rather than as an accelerator - see setup_shortcuts().
+    m_item_terminal_window = Gtk::make_managed<Gtk::MenuItem>(
+        "Run in Terminal _Window (Ctrl+Shift+Enter)", true);
+    m_item_terminal_window->signal_activate().connect(
+        sigc::mem_fun(*this, &ShellSheet::on_menu_terminal_window));
+    terminal_menu->append(*m_item_terminal_window);
+
     m_item_send_eof = Gtk::make_managed<Gtk::MenuItem>("Send _EOF", true);
     m_item_send_eof->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_send_eof));
     terminal_menu->append(*m_item_send_eof);
@@ -734,6 +742,15 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     // open with no keyboard way out.
     if (event->keyval == GDK_KEY_Escape && m_search_bar.get_search_mode()) {
         m_search_bar.set_search_mode(false);
+        return true;
+    }
+
+    // Ctrl+Shift+Enter forces a terminal launch. Checked before the plain
+    // Enter handling below, which would otherwise treat it as input for a
+    // running command.
+    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) &&
+        (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter)) {
+        on_menu_terminal_window();
         return true;
     }
 
@@ -1625,7 +1642,80 @@ void ShellSheet::on_menu_about() {
     dialog.run();
 }
 
-void ShellSheet::on_menu_terminal() {
+void ShellSheet::on_menu_terminal() { run_current_line(/*force_terminal=*/false); }
+
+void ShellSheet::on_menu_terminal_window() { run_current_line(/*force_terminal=*/true); }
+
+void ShellSheet::reap_launched_terminal(int, int) {
+    // Intentionally empty. Connecting a child watch at all is what lets glib
+    // reap the emulator process; there is nothing to report, because nothing
+    // is running inside this app.
+}
+
+void ShellSheet::launch_in_terminal(const std::string& command,
+                                     const Gtk::TextIter& line_end) {
+    // Put the response where a command's output would have gone.
+    m_text_buffer->move_mark(m_command_mark, line_end);
+    m_text_buffer->insert(m_command_mark->get_iter(), "\n");
+    m_text_buffer->move_mark(m_input_mark, m_command_mark->get_iter());
+
+    const char* terminal_env = std::getenv("TERMINAL");
+    TerminalEmulator terminal;
+    auto on_path = [](const std::string& binary) {
+        return !Glib::find_program_in_path(binary).empty();
+    };
+
+    if (!find_terminal_emulator(terminal_env ? terminal_env : "", on_path, terminal)) {
+        // Deliberately does NOT fall back to running in the buffer: that is
+        // what produces a screenful of escape sequences, which is the whole
+        // problem this avoids.
+        append_status_line("No terminal emulator found. Set $TERMINAL, or install "
+                            "one (ptyxis, gnome-terminal, konsole, xterm, ...).");
+        m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
+        return;
+    }
+
+    // Note the absence of the `sudo -A` rewrite the in-buffer path does: in
+    // a real terminal sudo prompts for itself, so the askpass helper is
+    // neither needed nor wanted here.
+    std::vector<std::string> argv_strings = build_terminal_argv(terminal, command);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        append_status_line("Failed to launch terminal: fork failed");
+        m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
+        return;
+    }
+
+    if (pid == 0) { // Child
+        // Its own session, so the terminal window outlives this app instead
+        // of being torn down with it.
+        ::setsid();
+        // Start where the worksheet's tracked cd's have got to. Doing it
+        // here rather than with each emulator's own --working-directory
+        // flag keeps the argument table down to one shape.
+        if (::chdir(m_working_dir.c_str()) != 0) {
+            ::_exit(1);
+        }
+
+        std::vector<char*> c_argv;
+        for (auto& arg : argv_strings) c_argv.push_back(&arg[0]);
+        c_argv.push_back(nullptr);
+
+        ::execvp(c_argv[0], c_argv.data());
+        ::_exit(1); // _exit, not exit - see the comment in run_current_line()
+    }
+
+    // Reaped, but not tracked: nothing is running inside the app, so there
+    // is no running indicator, no pipes and no stdin to forward.
+    Glib::signal_child_watch().connect(
+        sigc::mem_fun(*this, &ShellSheet::reap_launched_terminal), pid);
+
+    append_status_line("Launched in " + terminal.binary + ": " + command);
+    m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
+}
+
+void ShellSheet::run_current_line(bool force_terminal) {
     if (m_is_command_running) {
         on_menu_terminate();
         return;
@@ -1651,6 +1741,15 @@ void ShellSheet::on_menu_terminal() {
     // tracked directory.
     if (is_cd_command(cmd_text)) {
         run_cd_command(cmd_text, end);
+        return;
+    }
+
+    // Full-screen programs (vim, htop, mc, watch...) cannot run in the
+    // buffer at all, so they go to a real terminal instead. Everything
+    // line-oriented - ping included, even though it runs indefinitely -
+    // keeps running here exactly as before. See terminal_launch.h.
+    if (force_terminal || needs_terminal(cmd_text)) {
+        launch_in_terminal(cmd_text, end);
         return;
     }
 

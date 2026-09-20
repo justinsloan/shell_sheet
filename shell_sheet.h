@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "directory_tracking.h"
+#include "terminal_launch.h"
 #include "text_search.h"
 #include "text_transforms.h"
 #include "undo_stack.h"
@@ -128,8 +129,19 @@ protected:
     void on_menu_save();
     void on_menu_quit();
     void on_menu_terminal();
+    void on_menu_terminal_window();
     void on_menu_terminate();
     void on_menu_send_eof();
+    // Shared body of both Run commands. force_terminal is the "Run in
+    // Terminal Window" menu item overriding needs_terminal()'s verdict.
+    void run_current_line(bool force_terminal);
+    // Hands the line to a native terminal emulator instead of running it
+    // in-buffer - for full-screen programs the buffer cannot host. See
+    // terminal_launch.h.
+    void launch_in_terminal(const std::string& command, const Gtk::TextIter& line_end);
+    // Child watch for the launched emulator. Does nothing except let glib
+    // reap it; nothing is running inside this app.
+    void reap_launched_terminal(int pid, int status);
     void on_menu_bashrc();
     void on_menu_hosts();
     void on_menu_about();
@@ -282,6 +294,7 @@ private:
     Gtk::MenuItem* m_item_save = nullptr;
     Gtk::MenuItem* m_item_quit = nullptr;
     Gtk::MenuItem* m_item_terminal = nullptr;
+    Gtk::MenuItem* m_item_terminal_window = nullptr;
     Gtk::MenuItem* m_item_send_eof = nullptr;
     Gtk::MenuItem* m_item_terminate = nullptr;
     Gtk::MenuItem* m_item_cut = nullptr;
