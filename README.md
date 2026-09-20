@@ -106,5 +106,4 @@ genuinely need GTK, such as `TextMark` gravity and font metrics.
 
 ## Licence
 
-No licence has been chosen yet — all rights reserved by default until one is
-added.
+MIT — see [LICENSE](LICENSE).
