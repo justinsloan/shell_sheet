@@ -38,6 +38,15 @@ std::string command_program(const std::string& command);
 // anyone means to do.
 bool needs_terminal(const std::string& command);
 
+// Byte offset just past the `sudo` word, for a line that invokes sudo -
+// i.e. where sudo's own options begin, so a flag can be inserted there.
+// Returns std::string::npos when the line does not invoke sudo.
+//
+// Uses the same word-walk as command_program(), so leading `VAR=value`
+// assignments are stepped over and `FOO=bar sudo apt update` is recognised
+// just as `sudo apt update` is.
+size_t sudo_options_offset(const std::string& command);
+
 // An installed terminal emulator and the arguments that precede the command.
 // Every emulator listed takes the command as ordinary argv entries, so
 // nothing here needs shell quoting.

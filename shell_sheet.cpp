@@ -991,8 +991,14 @@ void ShellSheet::update_syntax_highlighting() {
             case TokenKind::Keyword:  tag = keyword_tag;  break;
             case TokenKind::Variable: tag = variable_tag; break;
         }
-        Gtk::TextIter start = m_text_buffer->get_iter_at_line_offset(span.line, span.start_col);
-        Gtk::TextIter end = m_text_buffer->get_iter_at_line_offset(span.line, span.end_col);
+        // get_iter_at_line_INDEX, not _offset: compute_highlight_spans()
+        // reports byte offsets (see syntax_highlight.h), while _offset takes
+        // character offsets. They differ the moment a line contains any
+        // multi-byte UTF-8 - an accent in a comment or string was enough to
+        // shift every tag on that line. This matches what
+        // refresh_search_matches() already does with the same kind of data.
+        Gtk::TextIter start = m_text_buffer->get_iter_at_line_index(span.line, span.start_col);
+        Gtk::TextIter end = m_text_buffer->get_iter_at_line_index(span.line, span.end_col);
         m_text_buffer->apply_tag(tag, start, end);
     }
 }
@@ -1210,7 +1216,10 @@ void ShellSheet::on_replace_current() {
     // A replace is always its own undo step, never merged with typing on
     // either side of it.
     m_force_new_undo_group = true;
+    size_t stack_before = m_undo_stack.size();
     m_text_buffer->erase(start, end);
+    // One undo step for the whole substitution - see on_replace_all().
+    m_link_next_edit_to_previous = m_undo_stack.size() > stack_before;
     m_text_buffer->insert(m_text_buffer->get_iter_at_offset(start_off), replacement);
 }
 
@@ -1226,11 +1235,26 @@ void ShellSheet::on_replace_all() {
     // an Insert never merge with each other - different kinds - so setting
     // the flag once, before the loop, is enough to isolate the whole
     // operation from whatever preceded it).
+    //
+    // Iterate a COPY, never m_match_offsets itself: each erase/insert below
+    // fires the buffer's changed signal synchronously, and with the search
+    // bar open that runs refresh_search_matches(), which clears and rebuilds
+    // m_match_offsets. Iterating the live member meant walking a vector that
+    // was being reallocated underneath the loop - AddressSanitizer reports a
+    // heap-use-after-free when a replacement creates further matches.
+    const std::vector<std::pair<int, int>> matches = m_match_offsets;
+
     m_force_new_undo_group = true;
-    for (auto it = m_match_offsets.rbegin(); it != m_match_offsets.rend(); ++it) {
+    for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
         Gtk::TextIter start = m_text_buffer->get_iter_at_offset(it->first);
         Gtk::TextIter end = m_text_buffer->get_iter_at_offset(it->second);
+
+        size_t stack_before = m_undo_stack.size();
         m_text_buffer->erase(start, end);
+        // Pair the insert with its erase so one Ctrl+Z reverses the whole
+        // substitution, instead of stopping at the erased-but-not-yet-
+        // replaced state the document was never actually in.
+        m_link_next_edit_to_previous = m_undo_stack.size() > stack_before;
         m_text_buffer->insert(m_text_buffer->get_iter_at_offset(it->first), replacement);
     }
 }
@@ -1797,14 +1821,21 @@ void ShellSheet::run_current_line(bool force_terminal) {
     }
 
     std::string shell_cmd = cmd_text;
-    bool is_sudo = (shell_cmd.find("sudo ") == 0);
+    // Found by walking words rather than matching a "sudo " prefix, so that
+    // `FOO=bar sudo apt update` is still recognised. The prefix test missed
+    // every such form and quietly skipped the askpass wiring below, leaving
+    // sudo with no tty and no way to ask for a password.
+    const size_t sudo_options_at = sudo_options_offset(cmd_text);
+    const bool is_sudo = (sudo_options_at != std::string::npos);
 
     // Let sudo itself prompt for the password (via SUDO_ASKPASS, wired up in
     // the forked child below) instead of us collecting it here. That way
     // sudo's own credential cache applies, and the password never passes
-    // through this process at all.
+    // through this process at all. -A is inserted just after the `sudo`
+    // word, wherever on the line that turned out to be.
     if (is_sudo) {
-        shell_cmd = "sudo -A " + shell_cmd.substr(5);
+        shell_cmd = cmd_text.substr(0, sudo_options_at) + " -A" +
+                     cmd_text.substr(sudo_options_at);
     }
 
     int pipe_in[2], pipe_out[2];
@@ -2084,6 +2115,38 @@ void ShellSheet::update_window_title() {
     if (get_title() != title) set_title(title);
 }
 
+namespace {
+
+// A GtkTextBuffer holds valid UTF-8 and cannot hold a NUL, but a command
+// can emit anything at all (`cat` on a binary, `find -print0`, `head -c 20
+// /dev/urandom`). Pass those bytes through untouched and GTK rejects the
+// insert with a warning, losing the whole chunk; truncate at the first NUL
+// and everything after it is silently dropped. So NULs become a visible
+// placeholder and any invalid sequence is replaced with U+FFFD, which keeps
+// the surrounding text and shows that something unprintable arrived.
+std::string sanitize_for_buffer(const std::string& bytes) {
+    std::string without_nuls;
+    without_nuls.reserve(bytes.size());
+    for (char c : bytes) {
+        if (c == '\0') {
+            without_nuls += "\xef\xbf\xbd"; // U+FFFD
+        } else {
+            without_nuls += c;
+        }
+    }
+
+    if (g_utf8_validate(without_nuls.c_str(), static_cast<gssize>(without_nuls.size()), nullptr)) {
+        return without_nuls;
+    }
+    char* valid = g_utf8_make_valid(without_nuls.c_str(),
+                                     static_cast<gssize>(without_nuls.size()));
+    std::string result = valid ? valid : std::string();
+    g_free(valid);
+    return result;
+}
+
+} // namespace
+
 bool ShellSheet::flush_output_buffer() {
     if (m_output_buffer.empty()) {
         return false;
@@ -2099,7 +2162,7 @@ bool ShellSheet::flush_output_buffer() {
     // A flush is always its own undo step, never merged with typing on
     // either side of it.
     m_force_new_undo_group = true;
-    m_text_buffer->insert(insert_pos, block);
+    m_text_buffer->insert(insert_pos, sanitize_for_buffer(block));
     // Pending typed-but-not-yet-submitted input, if any, starts fresh after
     // this newly-arrived output (see on_key_press).
     m_text_buffer->move_mark(m_input_mark, m_command_mark->get_iter());
@@ -2116,7 +2179,7 @@ bool ShellSheet::on_command_output_received(Glib::IOCondition condition) {
         ssize_t bytes_read = ::read(m_command_output_fd, buffer, sizeof(buffer) - 1);
         if (bytes_read > 0) {
             buffer[bytes_read] = '\0';
-            m_output_buffer.push_back(std::string(buffer));
+            m_output_buffer.push_back(std::string(buffer, bytes_read));
 
             if (!m_output_timeout_conn.connected()) {
                 m_output_timeout_conn = Glib::signal_timeout().connect(
@@ -2192,7 +2255,7 @@ void ShellSheet::handle_process_exit(int pid, int status) {
             ssize_t bytes_read;
             while ((bytes_read = ::read(m_command_output_fd, buffer, sizeof(buffer) - 1)) > 0) {
                 buffer[bytes_read] = '\0';
-                m_output_buffer.push_back(std::string(buffer));
+                m_output_buffer.push_back(std::string(buffer, bytes_read));
             }
             ::close(m_command_output_fd);
             m_command_output_fd = -1;

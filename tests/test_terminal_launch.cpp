@@ -86,6 +86,27 @@ int main() {
     expect_eq("a long option with a separate value",
               command_program("sudo --user bob vim f"), "vim");
 
+    // --- sudo_options_offset: where a `-A` flag has to be inserted ---
+    auto insert_A = [](const std::string& cmd) {
+        size_t at = sudo_options_offset(cmd);
+        if (at == std::string::npos) return std::string("(not sudo)");
+        return cmd.substr(0, at) + " -A" + cmd.substr(at);
+    };
+    expect_eq("plain sudo", insert_A("sudo apt update"), "sudo -A apt update");
+    expect_eq("sudo after an env assignment",
+              insert_A("FOO=bar sudo apt update"), "FOO=bar sudo -A apt update");
+    expect_eq("sudo after several assignments",
+              insert_A("A=1 B=2 sudo x"), "A=1 B=2 sudo -A x");
+    expect_eq("sudo by absolute path",
+              insert_A("/usr/bin/sudo vim f"), "/usr/bin/sudo -A vim f");
+    expect_eq("sudo with leading whitespace", insert_A("  sudo ls"), "  sudo -A ls");
+    expect_eq("sudo on its own", insert_A("sudo"), "sudo -A");
+    expect_eq("not sudo at all", insert_A("apt update"), "(not sudo)");
+    expect_eq("a program merely starting with those letters",
+              insert_A("sudoedit f"), "(not sudo)");
+    expect_eq("sudo not in first position is not ours to rewrite",
+              insert_A("time sudo x"), "(not sudo)");
+
     // --- needs_terminal: the programs that must go to a terminal ---
     for (const char* p : {"vi", "vim", "vimdiff", "nvim", "view", "nano", "pico",
                            "emacs", "joe", "jed", "micro", "helix", "hx", "kak",

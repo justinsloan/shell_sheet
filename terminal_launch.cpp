@@ -139,6 +139,29 @@ std::string command_program(const std::string& command) {
     return strip_directory(words[i]);
 }
 
+size_t sudo_options_offset(const std::string& command) {
+    size_t i = 0;
+    const size_t n = command.size();
+    std::string word;
+
+    // Walk real words in the ORIGINAL string, tracking where each ends, so
+    // the returned offset indexes into the caller's own line.
+    while (i < n) {
+        size_t start = command.find_first_not_of(kWordSeparators, i);
+        if (start == std::string::npos) return std::string::npos;
+        size_t end = command.find_first_of(kWordSeparators, start);
+        if (end == std::string::npos) end = n;
+        word = command.substr(start, end - start);
+
+        if (is_env_assignment(word)) {
+            i = end;
+            continue;
+        }
+        return (strip_directory(word) == "sudo") ? end : std::string::npos;
+    }
+    return std::string::npos;
+}
+
 bool needs_terminal(const std::string& command) {
     std::string program = command_program(command);
     if (program.empty()) return false;
