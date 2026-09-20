@@ -67,6 +67,25 @@ int main() {
     expect_eq("env assignment then sudo",
               command_program("A=1 sudo vim f"), "vim");
 
+    // A multi-line SELECTION is a supported way to run commands, so the
+    // newline must separate words like any other whitespace - otherwise the
+    // whole block reads as one program name and nothing is ever detected.
+    expect_eq("a newline separates words", command_program("htop\nls"), "htop");
+    expect_eq("...with arguments on the first line",
+              command_program("vim f\nmake"), "vim");
+    expect_eq("a carriage return separates too", command_program("htop\r\nls"), "htop");
+
+    // sudo's short options can be bundled, and can carry their value attached.
+    expect_eq("bundled short options ending in one that takes a value",
+              command_program("sudo -Hu bob vim f"), "vim");
+    expect_eq("a short option with its value attached",
+              command_program("sudo -ubob vim f"), "vim");
+    expect_eq("another bundle", command_program("sudo -iu bob htop"), "htop");
+    expect_eq("a long option with an attached value",
+              command_program("sudo --user=bob vim f"), "vim");
+    expect_eq("a long option with a separate value",
+              command_program("sudo --user bob vim f"), "vim");
+
     // --- needs_terminal: the programs that must go to a terminal ---
     for (const char* p : {"vi", "vim", "vimdiff", "nvim", "view", "nano", "pico",
                            "emacs", "joe", "jed", "micro", "helix", "hx", "kak",
@@ -131,15 +150,25 @@ int main() {
     expect_eq("...over the priority list", term.binary, "konsole");
     expect_eq("...with konsole's own flag", join(term.pre_args), "-e");
 
-    // ...and an unknown $TERMINAL still works, just with no preceding args.
-    expect_true("an unknown $TERMINAL is still used",
-                find_terminal_emulator("myterm", only({"myterm"}), term));
-    expect_eq("...by name", term.binary, "myterm");
-
     // ...but a $TERMINAL that isn't installed falls back.
     expect_true("an uninstalled $TERMINAL falls back to the list",
                 find_terminal_emulator("konsole", only({"xterm"}), term));
     expect_eq("...to what is installed", term.binary, "xterm");
+
+    // A $TERMINAL given as a path must still be recognised, and still be
+    // exec'd by the exact path the user gave.
+    expect_true("an absolute $TERMINAL path is recognised",
+                find_terminal_emulator("/usr/bin/gnome-terminal",
+                                        only({"/usr/bin/gnome-terminal"}), term));
+    expect_eq("...and exec'd by that exact path", term.binary, "/usr/bin/gnome-terminal");
+    expect_eq("...with the arguments its basename calls for", join(term.pre_args), "--");
+
+    // An emulator nobody listed still has to be given SOME exec flag, or it
+    // just opens an empty shell and silently drops the command.
+    expect_true("an unlisted $TERMINAL is used",
+                find_terminal_emulator("lxterminal", only({"lxterminal"}), term));
+    expect_eq("...by name", term.binary, "lxterminal");
+    expect_eq("...with -e, the near-universal convention", join(term.pre_args), "-e");
 
     expect_true("reports failure when nothing is installed",
                 !find_terminal_emulator("", only({}), term));

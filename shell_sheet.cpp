@@ -7,6 +7,7 @@
 #include <vector>
 #include <cerrno>
 #include <cstdlib>
+#include <csignal>
 #include <cstring> // strsignal
 #include <fcntl.h>
 #include <unistd.h>
@@ -1642,22 +1643,58 @@ void ShellSheet::on_menu_about() {
     dialog.run();
 }
 
-void ShellSheet::on_menu_terminal() { run_current_line(/*force_terminal=*/false); }
+void ShellSheet::on_menu_terminal() {
+    // Ctrl+Enter doubles as Terminate while something is running: the
+    // in-buffer pipeline has exactly one slot (one pid, one pair of pipes),
+    // so there is no way to start a second command in it.
+    if (m_is_command_running) {
+        on_menu_terminate();
+        return;
+    }
+    run_current_line(/*force_terminal=*/false);
+}
 
-void ShellSheet::on_menu_terminal_window() { run_current_line(/*force_terminal=*/true); }
+void ShellSheet::on_menu_terminal_window() {
+    // Deliberately NO terminate check. A terminal launch uses none of that
+    // pipeline - no pid to track, no pipes, no stdin to forward - so it can
+    // happen alongside a running command instead of killing it. Asking for
+    // a new window is not a request to stop what is already running.
+    run_current_line(/*force_terminal=*/true);
+}
 
-void ShellSheet::reap_launched_terminal(int, int) {
-    // Intentionally empty. Connecting a child watch at all is what lets glib
-    // reap the emulator process; there is nothing to report, because nothing
-    // is running inside this app.
+void ShellSheet::reap_launched_terminal(int, int status) {
+    // Connecting a child watch is what lets glib reap the emulator, but the
+    // exit status matters too. The child _exit(1)s when chdir() or execvp()
+    // fails, and an emulator that rejects its arguments exits immediately
+    // as well - in which case no window ever appears and, without this, the
+    // worksheet would still be claiming "Launched in ...".
+    //
+    // A clean exit is normal and silent: most emulators are single-instance
+    // clients that hand the window to a daemon and return straight away.
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        append_status_line("Terminal exited immediately (status " +
+                            std::to_string(WEXITSTATUS(status)) +
+                            "); the command may not have run.");
+    } else if (WIFSIGNALED(status)) {
+        append_status_line(std::string("Terminal ") + strsignal(WTERMSIG(status)));
+    }
 }
 
 void ShellSheet::launch_in_terminal(const std::string& command,
                                      const Gtk::TextIter& line_end) {
-    // Put the response where a command's output would have gone.
-    m_text_buffer->move_mark(m_command_mark, line_end);
-    m_text_buffer->insert(m_command_mark->get_iter(), "\n");
-    m_text_buffer->move_mark(m_input_mark, m_command_mark->get_iter());
+    // A terminal can be launched while an in-buffer command is still
+    // running. In that case m_command_mark is that command's live output
+    // insertion point: moving it would scatter the rest of its output
+    // somewhere else in the document. So the notice is only positioned
+    // under the command line when nothing else is writing; otherwise it is
+    // simply appended wherever output is currently going.
+    const bool idle = !m_is_command_running;
+
+    if (idle) {
+        m_text_buffer->move_mark(m_command_mark, line_end);
+        m_text_buffer->insert(m_command_mark->get_iter(), "\n");
+        m_text_buffer->move_mark(m_input_mark, m_command_mark->get_iter());
+    }
 
     const char* terminal_env = std::getenv("TERMINAL");
     TerminalEmulator terminal;
@@ -1671,7 +1708,7 @@ void ShellSheet::launch_in_terminal(const std::string& command,
         // problem this avoids.
         append_status_line("No terminal emulator found. Set $TERMINAL, or install "
                             "one (ptyxis, gnome-terminal, konsole, xterm, ...).");
-        m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
+        if (idle) m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
         return;
     }
 
@@ -1683,7 +1720,7 @@ void ShellSheet::launch_in_terminal(const std::string& command,
     pid_t pid = fork();
     if (pid < 0) {
         append_status_line("Failed to launch terminal: fork failed");
-        m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
+        if (idle) m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
         return;
     }
 
@@ -1691,6 +1728,13 @@ void ShellSheet::launch_in_terminal(const std::string& command,
         // Its own session, so the terminal window outlives this app instead
         // of being torn down with it.
         ::setsid();
+        // main() ignores SIGPIPE process-wide so a write to a dead
+        // command's stdin can't kill the app - but an ignored disposition
+        // SURVIVES exec, so without this every program in the launched
+        // terminal would inherit it and normal pipeline teardown
+        // (`yes | head`) would turn into EPIPE errors instead of a clean
+        // exit. The app's own handling is unaffected.
+        std::signal(SIGPIPE, SIG_DFL);
         // Start where the worksheet's tracked cd's have got to. Doing it
         // here rather than with each emulator's own --working-directory
         // flag keeps the argument table down to one shape.
@@ -1712,15 +1756,10 @@ void ShellSheet::launch_in_terminal(const std::string& command,
         sigc::mem_fun(*this, &ShellSheet::reap_launched_terminal), pid);
 
     append_status_line("Launched in " + terminal.binary + ": " + command);
-    m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
+    if (idle) m_text_buffer->move_mark(m_command_mark, m_text_buffer->end());
 }
 
 void ShellSheet::run_current_line(bool force_terminal) {
-    if (m_is_command_running) {
-        on_menu_terminate();
-        return;
-    }
-
     Gtk::TextIter start, end;
     if (!m_text_view.get_buffer()->get_selection_bounds(start, end)) {
         start = m_text_buffer->get_iter_at_mark(m_text_view.get_buffer()->get_insert());
@@ -1739,7 +1778,11 @@ void ShellSheet::run_current_line(bool force_terminal) {
     // are deliberately not caught by this (see directory_tracking.h) - they
     // still run through the shell and still work, they just don't move the
     // tracked directory.
-    if (is_cd_command(cmd_text)) {
+    // Not when a terminal was explicitly asked for: "Run in Terminal Window"
+    // should do exactly what it says. It also keeps run_cd_command - which
+    // moves m_command_mark - away from the case where a command is already
+    // running and that mark is the live output insertion point.
+    if (!force_terminal && is_cd_command(cmd_text)) {
         run_cd_command(cmd_text, end);
         return;
     }
@@ -1779,6 +1822,10 @@ void ShellSheet::run_current_line(bool force_terminal) {
     }
 
     if (pid == 0) { // Child
+        // Same reasoning as in launch_in_terminal(): the process-wide
+        // SIGPIPE ignore set in main() survives exec, and the user's
+        // command should see default signal behaviour, not ours.
+        std::signal(SIGPIPE, SIG_DFL);
         // Run where the worksheet's tracked `cd`s have got to. Done in the
         // child so the app's own working directory is left alone (file
         // dialogs and relative paths in the parent keep behaving).

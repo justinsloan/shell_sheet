@@ -11,13 +11,18 @@ std::string trim(const std::string& s) {
     return s.substr(first, last - first + 1);
 }
 
+// Newline counts as a separator, not just space/tab: a command can be a
+// multi-line SELECTION, and treating the whole block as one word would mean
+// no program was ever recognised in it.
+const char* const kWordSeparators = " \t\r\n";
+
 std::vector<std::string> split_words(const std::string& s) {
     std::vector<std::string> words;
     size_t i = 0;
     while (i < s.size()) {
-        size_t start = s.find_first_not_of(" \t", i);
+        size_t start = s.find_first_not_of(kWordSeparators, i);
         if (start == std::string::npos) break;
-        size_t end = s.find_first_of(" \t", start);
+        size_t end = s.find_first_of(kWordSeparators, start);
         if (end == std::string::npos) end = s.size();
         words.push_back(s.substr(start, end - start));
         i = end;
@@ -34,15 +39,27 @@ bool is_env_assignment(const std::string& word) {
     return slash == std::string::npos || eq < slash;
 }
 
-// sudo options that consume the following word, so it isn't mistaken for the
-// program being run.
+// Does this sudo option consume the NEXT word, so that word isn't mistaken
+// for the program being run?
+//
+// Short options can be bundled and can carry their value attached, so the
+// test is on the cluster's LAST letter: `-Hu bob` ends in a value-taking
+// `u` and swallows `bob`, while `-ubob` ends in `b` and swallows nothing
+// because its value is already attached.
 bool sudo_option_takes_argument(const std::string& option) {
-    static const std::set<std::string> with_argument = {
-        "-u", "--user", "-g", "--group", "-p", "--prompt",
-        "-C", "--close-from", "-h", "--host", "-R", "--chroot",
-        "-D", "--chdir", "-t", "--type", "-r", "--role", "-U", "--other-user",
+    static const std::set<std::string> long_with_argument = {
+        "--user", "--group", "--prompt", "--close-from", "--host",
+        "--chroot", "--chdir", "--type", "--role", "--other-user",
     };
-    return with_argument.count(option) > 0;
+    static const std::string short_with_argument = "ugpChRDtrU";
+
+    if (option.rfind("--", 0) == 0) {
+        // `--user=bob` carries its value already.
+        if (option.find('=') != std::string::npos) return false;
+        return long_with_argument.count(option) > 0;
+    }
+    if (option.size() < 2 || option[0] != '-') return false;
+    return short_with_argument.find(option.back()) != std::string::npos;
 }
 
 std::string strip_directory(const std::string& path) {
@@ -81,7 +98,7 @@ const std::vector<TerminalEmulator>& known_emulators() {
         {"gnome-terminal", {"--"}},
         {"konsole",        {"-e"}},
         {"xfce4-terminal", {"-x"}},
-        {"mate-terminal",  {"--"}},
+        {"mate-terminal",  {"-x"}},   // forked from gnome-terminal 2.x: -x, not --
         {"alacritty",      {"-e"}},
         {"kitty",          {}},
         {"foot",           {}},
@@ -132,15 +149,22 @@ bool find_terminal_emulator(const std::string& terminal_env,
                              const std::function<bool(const std::string&)>& is_available,
                              TerminalEmulator& out) {
     if (!terminal_env.empty() && is_available(terminal_env)) {
-        // A $TERMINAL we happen to know gets its proper arguments; one we
-        // don't is still honoured, just invoked bare.
+        // Matched on the basename, so `TERMINAL=/usr/bin/gnome-terminal`
+        // still gets gnome-terminal's arguments - while still being exec'd
+        // by the exact path the user asked for.
+        const std::string name = strip_directory(terminal_env);
         for (const TerminalEmulator& known : known_emulators()) {
-            if (known.binary == terminal_env) {
-                out = known;
+            if (known.binary == name) {
+                out = TerminalEmulator{terminal_env, known.pre_args};
                 return true;
             }
         }
-        out = TerminalEmulator{terminal_env, {}};
+        // An emulator nobody listed still needs SOME exec flag. Invoked
+        // bare it would just open an empty shell and drop the command
+        // entirely. `-e` is the near-universal convention (xterm, urxvt,
+        // st, konsole, lxterminal, qterminal...); the handful that differ
+        // are all in the table above.
+        out = TerminalEmulator{terminal_env, {"-e"}};
         return true;
     }
 
