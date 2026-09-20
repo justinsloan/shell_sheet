@@ -1,5 +1,7 @@
 # shell_sheet
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A text editor where any line can be a shell command.
 
 Put the cursor on a line, press **Ctrl+Enter**, and the command runs — its
@@ -104,6 +106,8 @@ genuinely need GTK, such as `TextMark` gravity and font metrics.
   for ASCII and wrong for multi-byte UTF-8.
 - A multi-line paste isn't forwarded to a running command line by line.
 
-## Licence
+## License
 
-MIT — see [LICENSE](LICENSE).
+Released under the MIT License — see [LICENSE](LICENSE) for the full text.
+
+Copyright (c) 2026 Justin Sloan.
