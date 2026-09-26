@@ -21,7 +21,8 @@
 
 using namespace Gtk;
 
-const std::string BUILD_NUMBER = "10";
+// Keep in step with the git tag and the README.
+const std::string VERSION = "0.10.0";
 
 // One indent level, in spaces. Used by both the Text menu's Indent/Dedent
 // items and the Tab/Shift+Tab handling in on_key_pressed(), so the two can
@@ -1637,7 +1638,7 @@ void ShellSheet::on_menu_about() {
     if (!m_about_dialog) {
         m_about_dialog = std::make_unique<Gtk::AboutDialog>();
         m_about_dialog->set_program_name("Shell Sheet");
-        m_about_dialog->set_version("Build " + BUILD_NUMBER);
+        m_about_dialog->set_version(VERSION);
         m_about_dialog->set_comments("A text editor where any line can be a shell command.");
         m_about_dialog->set_copyright("Copyright \u00a9 2026 Justin Sloan");
         m_about_dialog->set_license_type(Gtk::License::MIT_X11);

@@ -13,6 +13,9 @@ TERMLAUNCH_TEST_TARGET = tests/test_terminal_launch
 SHORTCUTS_TEST_TARGET = tests/test_shortcuts
 MARKS_TEST_TARGET = tests/test_marks
 
+PREFIX ?= /usr/local
+DESTDIR ?=
+
 all: $(TARGET)
 
 rebuild: clean all
@@ -73,7 +76,18 @@ test-marks: $(MARKS_TEST_TARGET)
 $(MARKS_TEST_TARGET): tests/test_marks.cpp
 	$(CXX) $(CXXFLAGS) tests/test_marks.cpp -o $(MARKS_TEST_TARGET) $(LDFLAGS)
 
+# Installs the binary and a desktop entry so the app shows up in the
+# launcher. PREFIX and DESTDIR follow the usual conventions, so packagers
+# can stage into a build root.
+install: $(TARGET)
+	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	install -Dm644 shell_sheet.desktop $(DESTDIR)$(PREFIX)/share/applications/shell_sheet.desktop
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	rm -f $(DESTDIR)$(PREFIX)/share/applications/shell_sheet.desktop
+
 clean:
 	rm -f $(OBJS) $(TARGET) $(TEST_TARGET) $(TRANSFORMS_TEST_TARGET) $(SEARCH_TEST_TARGET) $(UNDO_TEST_TARGET) $(DIRTRACK_TEST_TARGET) $(TERMLAUNCH_TEST_TARGET) $(SHORTCUTS_TEST_TARGET) $(MARKS_TEST_TARGET)
 
-.PHONY: all rebuild clean test test-marks
+.PHONY: all rebuild clean install uninstall test test-marks

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Shell Sheet
+GenericName=Shell Worksheet
+Comment=A text editor where any line can be a shell command
+Exec=shell_sheet
+Icon=accessories-text-editor
+Terminal=false
+Categories=Utility;TextEditor;
+Keywords=shell;terminal;editor;worksheet;command;

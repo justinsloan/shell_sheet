@@ -49,7 +49,24 @@ Also: shell syntax highlighting, find & replace with regex, full undo/redo,
 zoom, soft wrap, and a Text menu of transformations (case, sort, indent,
 duplicate/move lines, hard wrap, tabs↔spaces, line endings, trim).
 
-## Building
+## Installing
+
+```bash
+./install.sh
+```
+
+Installs the build dependencies for your distribution (apt, dnf, pacman or
+zypper), builds, and installs to `/usr/local` along with a desktop entry.
+Every command needing root is printed before it runs, one at a time.
+
+```bash
+./install.sh --prefix ~/.local   # no root needed
+./install.sh --skip-deps         # dependencies already present
+./install.sh --dry-run           # show what it would do, change nothing
+make uninstall                   # remove it again
+```
+
+## Building by hand
 
 Needs a C++17 compiler and gtkmm-4.0.
 
