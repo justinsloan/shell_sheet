@@ -23,7 +23,7 @@ using namespace Gtk;
 const std::string BUILD_NUMBER = "10";
 
 // One indent level, in spaces. Used by both the Text menu's Indent/Dedent
-// items and the Tab/Shift+Tab handling in on_key_press(), so the two can
+// items and the Tab/Shift+Tab handling in on_key_pressed(), so the two can
 // never disagree about how far a level is.
 const int kIndentWidth = 4;
 
@@ -43,16 +43,19 @@ ShellSheet::ShellSheet() {
     set_default_size(800, 600);
 
     apply_css();
-    setup_ui_layout();
+    // Order matters: setup_ui_layout() packs m_menu_bar into the box, and
+    // under GTK4 that is a pointer which setup_menu() creates. Actions come
+    // first because the menu model refers to them by name.
+    setup_actions();
     setup_menu();
-    setup_shortcuts();
+    setup_ui_layout();
 
     m_text_buffer = m_text_view.get_buffer();
     m_command_mark = m_text_buffer->create_mark("command_mark", m_text_buffer->end(), false);
     // Left gravity: unlike m_command_mark, this must NOT get dragged forward
     // by the very insertions it's supposed to bound (the user's own typed
     // characters land exactly at its position), so it stays put while text
-    // accumulates after it. See on_key_press().
+    // accumulates after it. See on_key_pressed().
     m_input_mark = m_text_buffer->create_mark("input_mark", m_text_buffer->end(), true);
     m_text_buffer->signal_changed().connect(sigc::mem_fun(*this, &ShellSheet::on_text_buffer_changed));
 
@@ -65,13 +68,19 @@ ShellSheet::ShellSheet() {
     m_text_buffer->signal_erase().connect(sigc::mem_fun(*this, &ShellSheet::on_buffer_erase), false);
 
     // Lets Enter forward a line of typed text to a running command's stdin
-    // (see on_key_press). Connected before the default handler so we can
+    // (see on_key_pressed). Connected before the default handler so we can
     // consume the event and suppress the normal newline-insertion behavior.
-    m_text_view.signal_key_press_event().connect(
-        sigc::mem_fun(*this, &ShellSheet::on_key_press), false);
+    // GTK4 delivers key events through a controller rather than a widget
+    // signal. `false` keeps it in the bubble phase, so the TextView's own
+    // bindings still run for everything we don't claim.
+    m_key_controller = Gtk::EventControllerKey::create();
+    m_key_controller->signal_key_pressed().connect(
+        sigc::mem_fun(*this, &ShellSheet::on_key_pressed), false);
+    m_text_view.add_controller(m_key_controller);
 
-    // Line number area drawing signal
-    m_line_number_area.signal_draw().connect(sigc::mem_fun(*this, &ShellSheet::on_line_number_area_draw));
+    // Line number area drawing
+    m_line_number_area.set_draw_func(
+        sigc::mem_fun(*this, &ShellSheet::on_line_number_area_draw));
     
     // Connect scroll adjustment to redraw line numbers
     m_scrolled_window.get_vadjustment()->signal_value_changed().connect(
@@ -102,11 +111,11 @@ ShellSheet::~ShellSheet() {
     // window, so it has to be taken off again explicitly - otherwise its
     // rules would keep applying to anything created afterwards.
     if (m_font_provider) {
-        Gtk::StyleContext::remove_provider_for_screen(Gdk::Screen::get_default(),
+        Gtk::StyleContext::remove_provider_for_display(Gdk::Display::get_default(),
                                                        m_font_provider);
     }
     if (m_running_css_provider) {
-        Gtk::StyleContext::remove_provider_for_screen(Gdk::Screen::get_default(),
+        Gtk::StyleContext::remove_provider_for_display(Gdk::Display::get_default(),
                                                        m_running_css_provider);
     }
 
@@ -164,12 +173,17 @@ void ShellSheet::apply_css() {
     // GtkTextView's text layout afterwards, which is exactly what zooming
     // needs it to do.
     m_font_provider = CssProvider::create();
-    Gtk::StyleContext::add_provider_for_screen(Gdk::Screen::get_default(), m_font_provider,
+    Gtk::StyleContext::add_provider_for_display(Gdk::Display::get_default(), m_font_provider,
                                                 GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
 Pango::FontDescription ShellSheet::text_view_font() const {
-    return m_text_view.get_style_context()->get_font(Gtk::STATE_FLAG_NORMAL);
+    // GTK4 removed StyleContext::get_font(). The TextView's font comes from
+    // the CSS apply_font_size() writes, so build the same description here
+    // from the same two values rather than trying to read it back.
+    Pango::FontDescription font("monospace");
+    font.set_size(m_font_size * PANGO_SCALE);
+    return font;
 }
 
 void ShellSheet::apply_font_size() {
@@ -206,7 +220,7 @@ void ShellSheet::set_font_size(int points) {
 }
 
 void ShellSheet::setup_cwd_bar() {
-    auto* row = Gtk::make_managed<Gtk::Box>(Gtk::ORIENTATION_HORIZONTAL, 6);
+    auto* row = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 6);
     row->set_margin_top(4);
     row->set_margin_bottom(4);
     row->set_margin_start(6);
@@ -219,15 +233,14 @@ void ShellSheet::setup_cwd_bar() {
     // that when a deep path doesn't fit it's the leading directories that
     // get cut, leaving the part you actually need to see.
     m_cwd_label.set_selectable(true);
-    m_cwd_label.set_ellipsize(Pango::ELLIPSIZE_START);
+    m_cwd_label.set_ellipsize(Pango::EllipsizeMode::START);
     m_cwd_label.set_xalign(0.0f);
 
-    row->pack_start(*caption, false, false);
-    row->pack_start(m_cwd_label, true, true);
+    row->append(*caption);
+    row->append(m_cwd_label);
 
-    m_cwd_revealer.add(*row);
-    m_cwd_revealer.set_transition_type(Gtk::REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
-    m_cwd_revealer.show_all();
+    m_cwd_revealer.set_child(*row);
+    m_cwd_revealer.set_transition_type(Gtk::RevealerTransitionType::SLIDE_DOWN);
     m_cwd_revealer.set_reveal_child(true);
 
     update_working_directory_display();
@@ -238,16 +251,16 @@ void ShellSheet::setup_running_bar() {
     // so it would leave an unpainted border around the orange. The same
     // spacing is applied as CSS padding below, which is inside the widget
     // and therefore gets the background colour.
-    auto* row = Gtk::make_managed<Gtk::Box>(Gtk::ORIENTATION_HORIZONTAL, 6);
+    auto* row = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 6);
 
-    m_running_label.set_ellipsize(Pango::ELLIPSIZE_END);
+    m_running_label.set_ellipsize(Pango::EllipsizeMode::END);
     m_running_label.set_xalign(0.0f);
-    row->pack_start(m_running_label, true, true);
+    row->append(m_running_label);
 
     // Colour and weight live in CSS rather than Pango markup so the label's
     // text stays plain - it holds a command line, and markup would treat
     // any '<' or '&' in it as broken markup.
-    row->get_style_context()->add_class("command-running-bar");
+    row->add_css_class("command-running-bar");
 
     m_running_css_provider = CssProvider::create();
     m_running_css_provider->load_from_data(
@@ -255,13 +268,12 @@ void ShellSheet::setup_running_bar() {
         ".command-running-bar label { color: #ffffff; font-weight: bold; }");
     // Screen-scoped for the same reason the font provider is: a
     // widget-scoped provider is unreliable about actually taking effect.
-    Gtk::StyleContext::add_provider_for_screen(Gdk::Screen::get_default(),
+    Gtk::StyleContext::add_provider_for_display(Gdk::Display::get_default(),
                                                 m_running_css_provider,
                                                 GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-    m_running_revealer.add(*row);
-    m_running_revealer.set_transition_type(Gtk::REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
-    m_running_revealer.show_all();
+    m_running_revealer.set_child(*row);
+    m_running_revealer.set_transition_type(Gtk::RevealerTransitionType::SLIDE_DOWN);
     m_running_revealer.set_reveal_child(false); // nothing is running at startup
 }
 
@@ -284,15 +296,20 @@ void ShellSheet::update_working_directory_display() {
 }
 
 void ShellSheet::on_menu_toggle_cwd_bar() {
-    m_cwd_revealer.set_reveal_child(m_item_show_cwd->get_active());
+    bool active = false;
+    m_action_show_cwd->get_state(active);
+    // A stateful action does not flip its own state on activation.
+    active = !active;
+    m_action_show_cwd->set_state(Glib::Variant<bool>::create(active));
+    m_cwd_revealer.set_reveal_child(active);
 }
 
-void ShellSheet::on_menu_wrap_mode_changed() {
+void ShellSheet::on_menu_wrap_mode_changed(const Glib::ustring& mode) {
     // WRAP_WORD_CHAR rather than WRAP_WORD: command output is full of long
     // unbroken tokens (paths, URLs, hashes) with no space to break at, and
     // WRAP_WORD would let those run off the edge anyway.
-    m_text_view.set_wrap_mode(m_item_soft_wrap->get_active() ? Gtk::WRAP_WORD_CHAR
-                                                              : Gtk::WRAP_NONE);
+    m_text_view.set_wrap_mode(mode == "soft" ? Gtk::WrapMode::WORD_CHAR
+                                              : Gtk::WrapMode::NONE);
     // Wrapped lines occupy more vertical space, so every line's y position
     // moves; the gutter has to be redrawn against the new geometry.
     m_line_number_area.queue_draw();
@@ -361,48 +378,49 @@ void ShellSheet::update_line_number_width(bool force_remeasure) {
 }
 
 void ShellSheet::setup_ui_layout() {
-    add(m_vbox);
+    set_child(m_vbox);
     m_vbox.set_spacing(0);
     m_vbox.set_margin_top(0);
     m_vbox.set_margin_bottom(0);
     m_vbox.set_margin_start(0);
     m_vbox.set_margin_end(0);
 
-    // Pack menu bar at the TOP
-    m_vbox.pack_start(m_menu_bar, PACK_SHRINK);
-    m_menu_bar.set_margin_bottom(0);
-    m_menu_bar.set_margin_top(0);
+    // Pack menu bar at the TOP. setup_menu() has already built it.
+    m_vbox.append(*m_menu_bar);
+    m_menu_bar->set_margin_bottom(0);
+    m_menu_bar->set_margin_top(0);
 
     // Working-directory bar, directly under the menu bar and above the
     // search bar. Contents are built in setup_cwd_bar().
-    m_vbox.pack_start(m_cwd_revealer, PACK_SHRINK);
+    m_vbox.append(m_cwd_revealer);
 
     // Running indicator, below the working-directory bar. Revealed only
     // while a command is in flight (see update_running_indicator()).
-    m_vbox.pack_start(m_running_revealer, PACK_SHRINK);
+    m_vbox.append(m_running_revealer);
 
     // Search bar sits right below the menu bar, hidden until Ctrl+F/H or
     // the Search menu reveals it (Gtk::SearchBar starts with search-mode
     // off by default, so nothing extra is needed here for that).
-    m_vbox.pack_start(m_search_bar, PACK_SHRINK);
+    m_vbox.append(m_search_bar);
 
     // Paned layout for line numbers + text view
-    m_vbox.pack_start(m_paned, PACK_EXPAND_WIDGET);
+    m_paned.set_vexpand(true);
+    m_vbox.append(m_paned);
     m_paned.set_margin_top(0);
     m_paned.set_margin_bottom(0);
     m_paned.set_margin_start(0);
     m_paned.set_margin_end(0);
     
-    m_paned.pack1(m_line_number_area, false, false);
+    m_paned.set_start_child(m_line_number_area);
     m_line_number_area.set_size_request(45, -1);
     m_line_number_area.set_margin_top(0);
     m_line_number_area.set_margin_bottom(0);
     m_line_number_area.set_margin_start(0);
     m_line_number_area.set_margin_end(0);
 
-    m_paned.pack2(m_scrolled_window, true, false);
-    m_scrolled_window.add(m_text_view);
-    m_scrolled_window.set_policy(POLICY_AUTOMATIC, POLICY_AUTOMATIC);
+    m_paned.set_end_child(m_scrolled_window);
+    m_scrolled_window.set_child(m_text_view);
+    m_scrolled_window.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC);
     m_scrolled_window.set_margin_top(0);
     m_scrolled_window.set_margin_bottom(0);
     m_scrolled_window.set_margin_start(0);
@@ -411,290 +429,213 @@ void ShellSheet::setup_ui_layout() {
     // Ensure the text view is editable
     m_text_view.set_editable(true);
     m_text_view.set_cursor_visible(true);
+}
 
-    show_all_children();
+void ShellSheet::setup_actions() {
+    // GTK4 drives menus through Gio actions rather than clickable widgets,
+    // so every command is registered once here and referred to by name from
+    // the menu model in setup_menu().
+    m_actions = Gio::SimpleActionGroup::create();
+    insert_action_group("win", m_actions);
+
+    auto add = [&](const char* name, void (ShellSheet::*handler)()) {
+        return m_actions->add_action(name, sigc::mem_fun(*this, handler));
+    };
+
+    // File
+    add("new", &ShellSheet::on_menu_new);
+    add("open", &ShellSheet::on_menu_open);
+    add("save", &ShellSheet::on_menu_save);
+    add("quit", &ShellSheet::on_menu_quit);
+
+    // Edit
+    m_action_undo = add("undo", &ShellSheet::on_menu_undo);
+    m_action_redo = add("redo", &ShellSheet::on_menu_redo);
+    add("cut", &ShellSheet::on_menu_cut);
+    add("copy", &ShellSheet::on_menu_copy);
+    add("paste", &ShellSheet::on_menu_paste);
+    add("select-all", &ShellSheet::on_menu_select_all);
+    add("select-line", &ShellSheet::on_menu_select_line);
+
+    // View
+    add("zoom-in", &ShellSheet::on_menu_zoom_in);
+    add("zoom-out", &ShellSheet::on_menu_zoom_out);
+    add("zoom-reset", &ShellSheet::on_menu_zoom_reset);
+    // A stateful boolean action: the menu renders it as a check item and
+    // keeps the tick in step with the state for us.
+    m_action_show_cwd = m_actions->add_action_bool(
+        "show-cwd", sigc::mem_fun(*this, &ShellSheet::on_menu_toggle_cwd_bar), true);
+    // A stateful string action renders as a radio group, one entry per
+    // value - the GTK4 replacement for Gtk::RadioMenuItem.
+    m_action_wrap = m_actions->add_action_radio_string(
+        "wrap", sigc::mem_fun(*this, &ShellSheet::on_menu_wrap_mode_changed), "none");
+
+    // Search
+    add("find", &ShellSheet::on_menu_find);
+    add("find-next", &ShellSheet::on_menu_find_next);
+    add("find-previous", &ShellSheet::on_menu_find_previous);
+    add("replace", &ShellSheet::on_menu_replace);
+
+    // Text
+    add("uppercase", &ShellSheet::on_transform_uppercase);
+    add("lowercase", &ShellSheet::on_transform_lowercase);
+    add("title-case", &ShellSheet::on_transform_title_case);
+    add("sort-ascending", &ShellSheet::on_transform_sort_ascending);
+    add("sort-descending", &ShellSheet::on_transform_sort_descending);
+    add("indent", &ShellSheet::on_transform_indent);
+    add("dedent", &ShellSheet::on_transform_dedent);
+    add("duplicate-line", &ShellSheet::on_transform_duplicate_line);
+    add("move-line-up", &ShellSheet::on_move_lines_up);
+    add("move-line-down", &ShellSheet::on_move_lines_down);
+    add("hard-wrap", &ShellSheet::on_transform_hard_wrap);
+    add("trim-trailing", &ShellSheet::on_transform_trim_trailing);
+    add("tabs-to-spaces", &ShellSheet::on_transform_tabs_to_spaces);
+    add("spaces-to-tabs", &ShellSheet::on_transform_spaces_to_tabs);
+    add("line-ending-lf", &ShellSheet::on_transform_line_ending_lf);
+    add("line-ending-crlf", &ShellSheet::on_transform_line_ending_crlf);
+    add("line-ending-cr", &ShellSheet::on_transform_line_ending_cr);
+
+    // Terminal
+    add("run", &ShellSheet::on_menu_terminal);
+    add("run-in-terminal", &ShellSheet::on_menu_terminal_window);
+    add("send-eof", &ShellSheet::on_menu_send_eof);
+    add("terminate", &ShellSheet::on_menu_terminate);
+
+    // Help
+    add("about", &ShellSheet::on_menu_about);
+
+    // Accelerators belong to the application, not the window, in GTK4.
+    auto app = std::dynamic_pointer_cast<Gtk::Application>(Gio::Application::get_default());
+    if (!app) return;
+
+    app->set_accels_for_action("win.open", {"<Control>o"});
+    app->set_accels_for_action("win.save", {"<Control>s"});
+    app->set_accels_for_action("win.quit", {"<Control>q"});
+    app->set_accels_for_action("win.run", {"<Control>Return", "<Control>KP_Enter"});
+    app->set_accels_for_action("win.send-eof", {"<Control>d"});
+    app->set_accels_for_action("win.undo", {"<Control>z"});
+    app->set_accels_for_action("win.redo", {"<Control><Shift>z"});
+    app->set_accels_for_action("win.select-line", {"<Control>l"});
+    app->set_accels_for_action("win.find", {"<Control>f"});
+    app->set_accels_for_action("win.find-next", {"<Control>g"});
+    app->set_accels_for_action("win.find-previous", {"<Control><Shift>g"});
+    app->set_accels_for_action("win.replace", {"<Control>h"});
+
+    // Deliberately NOT given accelerators, and handled in on_key_presseded()
+    // instead: Ctrl+C (must still mean Copy unless a command is running),
+    // Escape, Tab/Shift+Tab, Ctrl+Shift+Enter, Alt+Up/Down, Ctrl+Shift+D and
+    // the zoom keys. An accelerator is matched before the focused widget
+    // sees the key, which would shadow the TextView's own bindings - the
+    // exact trap that once stopped Ctrl+C from copying. Cut/Copy/Paste get
+    // menu entries but no accelerators for the same reason: the TextView
+    // already implements those keys itself.
 }
 
 void ShellSheet::setup_menu() {
-    auto* file_menu_item = Gtk::make_managed<Gtk::MenuItem>("_File", true);
-    auto* file_menu = Gtk::make_managed<Gtk::Menu>();
-    file_menu_item->set_submenu(*file_menu);
+    auto menu = Gio::Menu::create();
 
-    m_item_new = Gtk::make_managed<Gtk::MenuItem>("_New", true);
-    m_item_new->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_new));
-    file_menu->append(*m_item_new);
+    auto file_menu = Gio::Menu::create();
+    file_menu->append("_New", "win.new");
+    file_menu->append("_Open", "win.open");
+    file_menu->append("_Save", "win.save");
+    file_menu->append("_Quit", "win.quit");
+    menu->append_submenu("_File", file_menu);
 
-    m_item_open = Gtk::make_managed<Gtk::MenuItem>("_Open", true);
-    m_item_open->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_open));
-    file_menu->append(*m_item_open);
+    auto edit_menu = Gio::Menu::create();
+    auto undo_section = Gio::Menu::create();
+    undo_section->append("_Undo", "win.undo");
+    undo_section->append("_Redo", "win.redo");
+    edit_menu->append_section(undo_section);
+    auto clipboard_section = Gio::Menu::create();
+    clipboard_section->append("Cu_t", "win.cut");
+    clipboard_section->append("_Copy", "win.copy");
+    clipboard_section->append("_Paste", "win.paste");
+    edit_menu->append_section(clipboard_section);
+    auto select_section = Gio::Menu::create();
+    select_section->append("Select _All", "win.select-all");
+    select_section->append("Select _Line", "win.select-line");
+    edit_menu->append_section(select_section);
+    menu->append_submenu("_Edit", edit_menu);
 
-    m_item_save = Gtk::make_managed<Gtk::MenuItem>("_Save", true);
-    m_item_save->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_save));
-    file_menu->append(*m_item_save);
+    auto view_menu = Gio::Menu::create();
+    auto zoom_section = Gio::Menu::create();
+    zoom_section->append("Zoom _In (Ctrl++)", "win.zoom-in");
+    zoom_section->append("Zoom _Out (Ctrl+-)", "win.zoom-out");
+    zoom_section->append("_Reset Zoom (Ctrl+0)", "win.zoom-reset");
+    view_menu->append_section(zoom_section);
+    auto cwd_section = Gio::Menu::create();
+    cwd_section->append("Show Working _Directory", "win.show-cwd");
+    view_menu->append_section(cwd_section);
+    // One action with two values renders as a radio pair.
+    auto wrap_section = Gio::Menu::create();
+    wrap_section->append("_No Wrap", "win.wrap::none");
+    wrap_section->append("_Soft Wrap", "win.wrap::soft");
+    view_menu->append_section(wrap_section);
+    menu->append_submenu("_View", view_menu);
 
-    file_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    m_item_quit = Gtk::make_managed<Gtk::MenuItem>("_Quit", true);
-    m_item_quit->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_quit));
-    file_menu->append(*m_item_quit);
-
-    m_menu_bar.append(*file_menu_item);
-
-    auto* edit_menu_item = Gtk::make_managed<Gtk::MenuItem>("_Edit", true);
-    auto* edit_menu = Gtk::make_managed<Gtk::Menu>();
-    edit_menu_item->set_submenu(*edit_menu);
-
-    m_item_undo = Gtk::make_managed<Gtk::MenuItem>("_Undo", true);
-    m_item_undo->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_undo));
-    m_item_undo->set_sensitive(false);
-    edit_menu->append(*m_item_undo);
-
-    m_item_redo = Gtk::make_managed<Gtk::MenuItem>("_Redo", true);
-    m_item_redo->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_redo));
-    m_item_redo->set_sensitive(false);
-    edit_menu->append(*m_item_redo);
-
-    edit_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    m_item_cut = Gtk::make_managed<Gtk::MenuItem>("Cu_t", true);
-    m_item_cut->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_cut));
-    edit_menu->append(*m_item_cut);
-
-    m_item_copy = Gtk::make_managed<Gtk::MenuItem>("_Copy", true);
-    m_item_copy->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_copy));
-    edit_menu->append(*m_item_copy);
-
-    m_item_paste = Gtk::make_managed<Gtk::MenuItem>("_Paste", true);
-    m_item_paste->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_paste));
-    edit_menu->append(*m_item_paste);
-
-    edit_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    m_item_select_all = Gtk::make_managed<Gtk::MenuItem>("Select _All", true);
-    m_item_select_all->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_select_all));
-    edit_menu->append(*m_item_select_all);
-
-    m_item_select_line = Gtk::make_managed<Gtk::MenuItem>("Select _Line", true);
-    m_item_select_line->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_select_line));
-    edit_menu->append(*m_item_select_line);
-
-    m_menu_bar.append(*edit_menu_item);
-
-    auto* view_menu_item = Gtk::make_managed<Gtk::MenuItem>("_View", true);
-    auto* view_menu = Gtk::make_managed<Gtk::Menu>();
-    view_menu_item->set_submenu(*view_menu);
-
-    // Shortcuts are in the labels because zoom is handled in on_key_press()
-    // rather than registered as accelerators - see setup_shortcuts().
-    m_item_zoom_in = Gtk::make_managed<Gtk::MenuItem>("Zoom _In (Ctrl++)", true);
-    m_item_zoom_in->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_zoom_in));
-    view_menu->append(*m_item_zoom_in);
-
-    m_item_zoom_out = Gtk::make_managed<Gtk::MenuItem>("Zoom _Out (Ctrl+-)", true);
-    m_item_zoom_out->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_zoom_out));
-    view_menu->append(*m_item_zoom_out);
-
-    view_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    m_item_zoom_reset = Gtk::make_managed<Gtk::MenuItem>("_Reset Zoom (Ctrl+0)", true);
-    m_item_zoom_reset->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_zoom_reset));
-    view_menu->append(*m_item_zoom_reset);
-
-    view_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    // A check item rather than a pair of Show/Hide entries: one menu
-    // function that both reports the current state and toggles it.
-    m_item_show_cwd = Gtk::make_managed<Gtk::CheckMenuItem>("Show Working _Directory", true);
-    m_item_show_cwd->set_active(true);
-    m_item_show_cwd->signal_toggled().connect(
-        sigc::mem_fun(*this, &ShellSheet::on_menu_toggle_cwd_bar));
-    view_menu->append(*m_item_show_cwd);
-
-    view_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    // Radio pair, not a check item: wrapping is a choice between two
-    // states, and naming both makes it obvious that "no wrap" is a mode
-    // rather than the absence of a feature. Purely visual - neither of
-    // these ever alters the text (Text > Hard Wrap is the one that does).
-    Gtk::RadioMenuItem::Group wrap_group;
-    m_item_no_wrap = Gtk::make_managed<Gtk::RadioMenuItem>(wrap_group, "_No Wrap", true);
-    m_item_soft_wrap = Gtk::make_managed<Gtk::RadioMenuItem>(wrap_group, "_Soft Wrap", true);
-    m_item_no_wrap->set_active(true); // matches the TextView's existing default
-    // Only one connection is needed: toggling either item emits on both.
-    m_item_soft_wrap->signal_toggled().connect(
-        sigc::mem_fun(*this, &ShellSheet::on_menu_wrap_mode_changed));
-    view_menu->append(*m_item_no_wrap);
-    view_menu->append(*m_item_soft_wrap);
-
-    m_menu_bar.append(*view_menu_item);
-
-    auto* search_menu_item = Gtk::make_managed<Gtk::MenuItem>("_Search", true);
-    auto* search_menu = Gtk::make_managed<Gtk::Menu>();
-    search_menu_item->set_submenu(*search_menu);
-
-    m_item_find = Gtk::make_managed<Gtk::MenuItem>("_Find", true);
-    m_item_find->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_find));
-    search_menu->append(*m_item_find);
-
-    m_item_find_next = Gtk::make_managed<Gtk::MenuItem>("Find _Next", true);
-    m_item_find_next->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_find_next));
-    search_menu->append(*m_item_find_next);
-
-    m_item_find_previous = Gtk::make_managed<Gtk::MenuItem>("Find Pre_vious", true);
-    m_item_find_previous->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_find_previous));
-    search_menu->append(*m_item_find_previous);
-
-    search_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-
-    m_item_replace = Gtk::make_managed<Gtk::MenuItem>("_Replace…", true);
-    m_item_replace->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_replace));
-    search_menu->append(*m_item_replace);
-
-    m_menu_bar.append(*search_menu_item);
+    auto search_menu = Gio::Menu::create();
+    search_menu->append("_Find", "win.find");
+    search_menu->append("Find _Next", "win.find-next");
+    search_menu->append("Find Pre_vious", "win.find-previous");
+    search_menu->append("_Replace…", "win.replace");
+    menu->append_submenu("_Search", search_menu);
 
     // Te_xt, not _Text: _Terminal already owns the T mnemonic at the
     // menu-bar level.
-    auto* text_menu_item = Gtk::make_managed<Gtk::MenuItem>("Te_xt", true);
-    auto* text_menu = Gtk::make_managed<Gtk::Menu>();
-    text_menu_item->set_submenu(*text_menu);
+    auto text_menu = Gio::Menu::create();
+    auto case_section = Gio::Menu::create();
+    case_section->append("_UPPERCASE", "win.uppercase");
+    case_section->append("_lowercase", "win.lowercase");
+    case_section->append("_Title Case", "win.title-case");
+    text_menu->append_section(case_section);
+    auto sort_section = Gio::Menu::create();
+    sort_section->append("Sort _Ascending", "win.sort-ascending");
+    sort_section->append("Sort D_escending", "win.sort-descending");
+    text_menu->append_section(sort_section);
+    // Shortcuts live in the labels because these are handled in
+    // on_key_presseded() rather than registered as accelerators.
+    auto indent_section = Gio::Menu::create();
+    indent_section->append("_Indent (Tab)", "win.indent");
+    indent_section->append("_Dedent (Shift+Tab)", "win.dedent");
+    text_menu->append_section(indent_section);
+    auto line_section = Gio::Menu::create();
+    line_section->append("Dup_licate Line (Ctrl+Shift+D)", "win.duplicate-line");
+    line_section->append("Move Line _Up (Alt+Up)", "win.move-line-up");
+    line_section->append("Move Line Do_wn (Alt+Down)", "win.move-line-down");
+    text_menu->append_section(line_section);
+    auto wrap_text_section = Gio::Menu::create();
+    wrap_text_section->append("_Hard Wrap at 80 Columns", "win.hard-wrap");
+    text_menu->append_section(wrap_text_section);
+    auto whitespace_section = Gio::Menu::create();
+    whitespace_section->append("Tri_m Trailing Whitespace", "win.trim-trailing");
+    text_menu->append_section(whitespace_section);
+    auto tabs_section = Gio::Menu::create();
+    tabs_section->append("Tabs to _Spaces", "win.tabs-to-spaces");
+    tabs_section->append("S_paces to Tabs", "win.spaces-to-tabs");
+    text_menu->append_section(tabs_section);
+    auto endings_section = Gio::Menu::create();
+    endings_section->append("Line Endings: _Unix (LF)", "win.line-ending-lf");
+    endings_section->append("Line Endings: _Windows (CRLF)", "win.line-ending-crlf");
+    endings_section->append("Line Endings: _Classic Mac (CR)", "win.line-ending-cr");
+    text_menu->append_section(endings_section);
+    menu->append_submenu("Te_xt", text_menu);
 
-    auto add_text_item = [&](const char* label, void (ShellSheet::*handler)()) {
-        auto* item = Gtk::make_managed<Gtk::MenuItem>(label, true);
-        item->signal_activate().connect(sigc::mem_fun(*this, handler));
-        text_menu->append(*item);
-    };
+    auto terminal_menu = Gio::Menu::create();
+    terminal_menu->append("_Run Command", "win.run");
+    terminal_menu->append("Run in Terminal _Window (Ctrl+Shift+Enter)", "win.run-in-terminal");
+    terminal_menu->append("Send _EOF", "win.send-eof");
+    // Shortcut is in the label because Ctrl+C is handled in on_key_presseded()
+    // rather than registered as an accelerator - see setup_actions().
+    terminal_menu->append("_Terminate (Ctrl+C)", "win.terminate");
+    menu->append_submenu("_Terminal", terminal_menu);
 
-    add_text_item("_UPPERCASE", &ShellSheet::on_transform_uppercase);
-    add_text_item("_lowercase", &ShellSheet::on_transform_lowercase);
-    add_text_item("_Title Case", &ShellSheet::on_transform_title_case);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    add_text_item("Sort _Ascending", &ShellSheet::on_transform_sort_ascending);
-    add_text_item("Sort D_escending", &ShellSheet::on_transform_sort_descending);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    // Shortcuts live in the labels because Tab/Shift+Tab are handled in
-    // on_key_press() rather than registered as accelerators - a Tab
-    // accelerator would shadow the TextView's own focus/tab handling the
-    // same way a Ctrl+C one shadowed Copy (see setup_shortcuts()).
-    add_text_item("_Indent (Tab)", &ShellSheet::on_transform_indent);
-    add_text_item("_Dedent (Shift+Tab)", &ShellSheet::on_transform_dedent);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    add_text_item("Dup_licate Line (Ctrl+Shift+D)", &ShellSheet::on_transform_duplicate_line);
-    add_text_item("Move Line _Up (Alt+Up)", &ShellSheet::on_move_lines_up);
-    add_text_item("Move Line Do_wn (Alt+Down)", &ShellSheet::on_move_lines_down);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    add_text_item("_Hard Wrap at 80 Columns", &ShellSheet::on_transform_hard_wrap);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    add_text_item("Tri_m Trailing Whitespace", &ShellSheet::on_transform_trim_trailing);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    add_text_item("Tabs to _Spaces", &ShellSheet::on_transform_tabs_to_spaces);
-    add_text_item("S_paces to Tabs", &ShellSheet::on_transform_spaces_to_tabs);
-    text_menu->append(*Gtk::make_managed<Gtk::SeparatorMenuItem>());
-    add_text_item("Line Endings: _Unix (LF)", &ShellSheet::on_transform_line_ending_lf);
-    add_text_item("Line Endings: _Windows (CRLF)", &ShellSheet::on_transform_line_ending_crlf);
-    add_text_item("Line Endings: _Classic Mac (CR)", &ShellSheet::on_transform_line_ending_cr);
+    auto help_menu = Gio::Menu::create();
+    help_menu->append("_About", "win.about");
+    menu->append_submenu("_Help", help_menu);
 
-    m_menu_bar.append(*text_menu_item);
-
-    auto* terminal_menu_item = Gtk::make_managed<Gtk::MenuItem>("_Terminal", true);
-    auto* terminal_menu = Gtk::make_managed<Gtk::Menu>();
-    terminal_menu_item->set_submenu(*terminal_menu);
-
-    m_item_terminal = Gtk::make_managed<Gtk::MenuItem>("_Run Command", true);
-    m_item_terminal->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_terminal));
-    terminal_menu->append(*m_item_terminal);
-
-    // Shortcut lives in the label because it is handled in on_key_press()
-    // rather than as an accelerator - see setup_shortcuts().
-    m_item_terminal_window = Gtk::make_managed<Gtk::MenuItem>(
-        "Run in Terminal _Window (Ctrl+Shift+Enter)", true);
-    m_item_terminal_window->signal_activate().connect(
-        sigc::mem_fun(*this, &ShellSheet::on_menu_terminal_window));
-    terminal_menu->append(*m_item_terminal_window);
-
-    m_item_send_eof = Gtk::make_managed<Gtk::MenuItem>("Send _EOF", true);
-    m_item_send_eof->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_send_eof));
-    terminal_menu->append(*m_item_send_eof);
-
-    // Shortcut is in the label because Ctrl+C is handled in on_key_press()
-    // rather than registered as an accelerator - see setup_shortcuts().
-    m_item_terminate = Gtk::make_managed<Gtk::MenuItem>("_Terminate (Ctrl+C)", true);
-    m_item_terminate->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_terminate));
-    terminal_menu->append(*m_item_terminate);
-
-    m_menu_bar.append(*terminal_menu_item);
-
-    auto* help_menu_item = Gtk::make_managed<Gtk::MenuItem>("_Help", true);
-    auto* help_menu = Gtk::make_managed<Gtk::Menu>();
-    help_menu_item->set_submenu(*help_menu);
-
-    m_item_about = Gtk::make_managed<Gtk::MenuItem>("_About", true);
-    m_item_about->signal_activate().connect(sigc::mem_fun(*this, &ShellSheet::on_menu_about));
-    help_menu->append(*m_item_about);
-
-    m_menu_bar.append(*help_menu_item);
-
-    m_menu_bar.show_all();
+    m_menu_bar = Gtk::make_managed<Gtk::PopoverMenuBar>(menu);
 }
 
-void ShellSheet::setup_shortcuts() {
-    auto accel_group = Gtk::AccelGroup::create();
-    add_accel_group(accel_group);
-
-    // File: Open
-    m_item_open->add_accelerator("activate", accel_group, GDK_KEY_o, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-    
-    // File: Save
-    m_item_save->add_accelerator("activate", accel_group, GDK_KEY_s, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-    
-    // File: Quit
-    m_item_quit->add_accelerator("activate", accel_group, GDK_KEY_q, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-    
-    // Terminal: Run Command (Ctrl+Enter)
-    m_item_terminal->add_accelerator("activate", accel_group, GDK_KEY_Return, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-    m_item_terminal->add_accelerator("activate", accel_group, GDK_KEY_KP_Enter, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-    
-    // Terminal: Send EOF (Ctrl+D)
-    m_item_send_eof->add_accelerator("activate", accel_group, GDK_KEY_d, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Terminal: Terminate - deliberately NOT registered as an accelerator
-    // here. GTK checks window accelerators before propagating a key press
-    // to the focused widget, so a Ctrl+C accelerator silently shadows the
-    // TextView's own Copy binding (verified: with it registered, Ctrl+A/X/V
-    // all worked but Ctrl+C never copied). Ctrl+C is instead handled in
-    // on_key_press(), which terminates only while a command is actually
-    // running and otherwise lets Copy through - the terminal convention,
-    // and no loss, since Terminate is a no-op when nothing is running.
-    // The label carries the shortcut so it stays discoverable in the menu.
-    
-    // Edit: Undo (Ctrl+Z)
-    m_item_undo->add_accelerator("activate", accel_group, GDK_KEY_z, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Edit: Redo (Ctrl+Shift+Z) - matches GNOME/gedit convention
-    m_item_redo->add_accelerator("activate", accel_group, GDK_KEY_z, Gdk::CONTROL_MASK | Gdk::SHIFT_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Edit: Select Line (Ctrl+L)
-    m_item_select_line->add_accelerator("activate", accel_group, GDK_KEY_l, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Edit: Cut/Copy/Paste/Select All deliberately get no accelerators here
-    // - Ctrl+X/C/V/A already work directly in the TextView via GTK's own
-    // built-in text-editing key bindings, regardless of any menu item. The
-    // menu items exist for discoverability, not to add new shortcuts.
-    // (Registering any of them here would in fact *break* the built-in
-    // binding rather than duplicate it, for the accelerator-priority reason
-    // described above for Terminate.)
-
-    // Search: Find (Ctrl+F)
-    m_item_find->add_accelerator("activate", accel_group, GDK_KEY_f, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Search: Find Next (Ctrl+G)
-    m_item_find_next->add_accelerator("activate", accel_group, GDK_KEY_g, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Search: Find Previous (Ctrl+Shift+G)
-    m_item_find_previous->add_accelerator("activate", accel_group, GDK_KEY_g, Gdk::CONTROL_MASK | Gdk::SHIFT_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-
-    // Search: Replace (Ctrl+H)
-    m_item_replace->add_accelerator("activate", accel_group, GDK_KEY_h, Gdk::CONTROL_MASK, static_cast<Gtk::AccelFlags>(GTK_ACCEL_VISIBLE));
-}
 
 void ShellSheet::on_scroll_changed() {
     m_line_number_area.queue_draw();
@@ -721,15 +662,18 @@ void ShellSheet::on_scroll_changed() {
 //
 // When no command is running, Enter is left to the default handler (normal
 // text editing).
-bool ShellSheet::on_key_press(GdkEventKey* event) {
+bool ShellSheet::on_key_pressed(guint keyval, guint /*keycode*/, Gdk::ModifierType state) {
+    const bool ctrl = (state & Gdk::ModifierType::CONTROL_MASK) == Gdk::ModifierType::CONTROL_MASK;
+    const bool shift = (state & Gdk::ModifierType::SHIFT_MASK) == Gdk::ModifierType::SHIFT_MASK;
+    const bool alt = (state & Gdk::ModifierType::ALT_MASK) == Gdk::ModifierType::ALT_MASK;
     // Ctrl+C: terminate the running command, the way it would at a
     // terminal - but only while one is actually running. With nothing
     // running there is nothing to terminate, so let the key fall through
     // to the TextView's own Copy binding instead of swallowing it. (This
     // lives here rather than as an accelerator precisely so Copy still
     // works; see setup_shortcuts().)
-    if ((event->state & GDK_CONTROL_MASK) &&
-        (event->keyval == GDK_KEY_c || event->keyval == GDK_KEY_C)) {
+    if ((ctrl) &&
+        (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
         if (m_is_command_running) {
             on_menu_terminate();
             return true;
@@ -741,7 +685,7 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     // but only while the find entry has focus - click into the document
     // after a search and Escape would do nothing, leaving the bar stuck
     // open with no keyboard way out.
-    if (event->keyval == GDK_KEY_Escape && m_search_bar.get_search_mode()) {
+    if (keyval == GDK_KEY_Escape && m_search_bar.get_search_mode()) {
         m_search_bar.set_search_mode(false);
         return true;
     }
@@ -749,20 +693,20 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     // Ctrl+Shift+Enter forces a terminal launch. Checked before the plain
     // Enter handling below, which would otherwise treat it as input for a
     // running command.
-    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) &&
-        (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter)) {
+    if (ctrl && shift &&
+        (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
         on_menu_terminal_window();
         return true;
     }
 
     // Alt+Up / Alt+Down move the current line or selection. GtkTextView
     // binds Ctrl+Up/Down (paragraph movement) but leaves Alt+Up/Down free.
-    if ((event->state & GDK_MOD1_MASK) && !(event->state & GDK_CONTROL_MASK)) {
-        if (event->keyval == GDK_KEY_Up || event->keyval == GDK_KEY_KP_Up) {
+    if (alt && !ctrl) {
+        if (keyval == GDK_KEY_Up || keyval == GDK_KEY_KP_Up) {
             on_move_lines_up();
             return true;
         }
-        if (event->keyval == GDK_KEY_Down || event->keyval == GDK_KEY_KP_Down) {
+        if (keyval == GDK_KEY_Down || keyval == GDK_KEY_KP_Down) {
             on_move_lines_down();
             return true;
         }
@@ -770,8 +714,8 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
 
     // Ctrl+Shift+D duplicates. Plain Ctrl+D is already Send EOF, which a
     // worksheet needs more than it needs a second duplicate binding.
-    if ((event->state & GDK_CONTROL_MASK) && (event->state & GDK_SHIFT_MASK) &&
-        (event->keyval == GDK_KEY_d || event->keyval == GDK_KEY_D)) {
+    if (ctrl && shift &&
+        (keyval == GDK_KEY_d || keyval == GDK_KEY_D)) {
         on_transform_duplicate_line();
         return true;
     }
@@ -780,8 +724,8 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     // Ctrl+C is (see setup_shortcuts()). Ctrl+Shift++ arrives as plain
     // GDK_KEY_plus because '+' is already the shifted '=', so accepting
     // both plus and equal makes the gesture work with or without Shift.
-    if (event->state & GDK_CONTROL_MASK) {
-        switch (event->keyval) {
+    if (ctrl) {
+        switch (keyval) {
             case GDK_KEY_plus:
             case GDK_KEY_equal:
             case GDK_KEY_KP_Add:
@@ -804,8 +748,8 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     // Shift+Tab always dedents - it has no other useful meaning in a text
     // buffer. (X11 delivers Shift+Tab as ISO_Left_Tab, not Tab with a shift
     // modifier, so both keyvals are checked.)
-    if (event->keyval == GDK_KEY_ISO_Left_Tab ||
-        (event->keyval == GDK_KEY_Tab && (event->state & GDK_SHIFT_MASK))) {
+    if (keyval == GDK_KEY_ISO_Left_Tab ||
+        (keyval == GDK_KEY_Tab && (shift))) {
         on_transform_dedent();
         return true;
     }
@@ -813,7 +757,7 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     // With no selection, or one inside a single line, Tab has to keep
     // meaning "insert a tab character" - this is a shell worksheet, and
     // tab-completing or typing a literal tab is ordinary work here.
-    if (event->keyval == GDK_KEY_Tab) {
+    if (keyval == GDK_KEY_Tab) {
         Gtk::TextIter sel_start, sel_end;
         if (m_text_buffer->get_selection_bounds(sel_start, sel_end) &&
             sel_start.get_line() != sel_end.get_line()) {
@@ -826,7 +770,7 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     if (!m_is_command_running || m_command_stdin_fd < 0) {
         return false;
     }
-    if (event->keyval != GDK_KEY_Return && event->keyval != GDK_KEY_KP_Enter) {
+    if (keyval != GDK_KEY_Return && keyval != GDK_KEY_KP_Enter) {
         return false;
     }
 
@@ -856,9 +800,11 @@ bool ShellSheet::on_key_press(GdkEventKey* event) {
     return true; // handled: suppress the default handler's own newline insert
 }
 
-bool ShellSheet::on_line_number_area_draw(const Cairo::RefPtr<Cairo::Context>& cr) {
-    Gtk::Allocation allocation = m_line_number_area.get_allocation();
-    double height = allocation.get_height();
+void ShellSheet::on_line_number_area_draw(const Cairo::RefPtr<Cairo::Context>& cr,
+                                           int /*width*/, int area_height) {
+    // GTK4 hands the draw function the area's size, so there is no need to
+    // go back to the allocation for it.
+    double height = area_height;
 
     cr->set_source_rgb(0.15, 0.15, 0.15); // Darker sidebar
     cr->paint();
@@ -907,8 +853,6 @@ bool ShellSheet::on_line_number_area_draw(const Cairo::RefPtr<Cairo::Context>& c
             layout->show_in_cairo_context(cr);
         }
     }
-
-    return true;
 }
 
 void ShellSheet::on_text_buffer_changed() {
@@ -1004,40 +948,40 @@ void ShellSheet::update_syntax_highlighting() {
 }
 
 void ShellSheet::setup_search_bar() {
-    auto* container = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL, 4));
+    auto* container = Gtk::manage(new Gtk::Box(Gtk::Orientation::VERTICAL, 4));
     container->set_margin_top(4);
     container->set_margin_bottom(4);
     container->set_margin_start(4);
     container->set_margin_end(4);
 
-    auto* find_row = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 4));
+    auto* find_row = Gtk::manage(new Gtk::Box(Gtk::Orientation::HORIZONTAL, 4));
     m_find_entry.set_placeholder_text("Find");
     m_case_sensitive_check.set_tooltip_text("Case sensitive");
     m_regex_check.set_tooltip_text("Regular expression");
-    find_row->pack_start(m_find_entry, true, true);
-    find_row->pack_start(m_find_prev_button, false, false);
-    find_row->pack_start(m_find_next_button, false, false);
-    find_row->pack_start(m_case_sensitive_check, false, false);
-    find_row->pack_start(m_regex_check, false, false);
-    find_row->pack_start(m_match_count_label, false, false);
+    find_row->append(m_find_entry);
+    find_row->append(m_find_prev_button);
+    find_row->append(m_find_next_button);
+    find_row->append(m_case_sensitive_check);
+    find_row->append(m_regex_check);
+    find_row->append(m_match_count_label);
 
-    auto* replace_row = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 4));
+    auto* replace_row = Gtk::manage(new Gtk::Box(Gtk::Orientation::HORIZONTAL, 4));
     m_replace_entry.set_placeholder_text("Replace");
-    replace_row->pack_start(m_replace_entry, true, true);
-    replace_row->pack_start(m_replace_button, false, false);
-    replace_row->pack_start(m_replace_all_button, false, false);
+    replace_row->append(m_replace_entry);
+    replace_row->append(m_replace_button);
+    replace_row->append(m_replace_all_button);
 
-    container->pack_start(*find_row, false, false);
-    container->pack_start(*replace_row, false, false);
+    container->append(*find_row);
+    container->append(*replace_row);
 
-    m_search_bar.add(*container);
+    m_search_bar.set_child(*container);
     // Lets the bar treat m_find_entry as its search entry even though it's
     // nested inside our own box rather than a direct child - this is what
     // wires up Escape-closes-bar for free.
     m_search_bar.connect_entry(m_find_entry);
     // ...but only while the entry has focus, and with nothing on screen to
     // say the bar can be dismissed at all. The built-in close button gives
-    // it a visible, mouse-reachable way out; on_key_press() handles Escape
+    // it a visible, mouse-reachable way out; on_key_pressed() handles Escape
     // from the text view.
     m_search_bar.set_show_close_button(true);
 
@@ -1060,8 +1004,6 @@ void ShellSheet::setup_search_bar() {
         sigc::mem_fun(*this, &ShellSheet::on_replace_current));
     m_replace_all_button.signal_clicked().connect(
         sigc::mem_fun(*this, &ShellSheet::on_replace_all));
-
-    m_search_bar.show_all();
     update_search_matches(); // initializes button sensitivity/label for the empty-pattern state
 }
 
@@ -1085,7 +1027,7 @@ void ShellSheet::clear_search_highlight() {
 
     m_match_offsets.clear();
     m_current_match_index = -1;
-    m_find_entry.get_style_context()->remove_class(GTK_STYLE_CLASS_ERROR);
+    m_find_entry.remove_css_class("error");
 }
 
 void ShellSheet::on_search_mode_changed() {
@@ -1124,7 +1066,7 @@ void ShellSheet::refresh_search_matches(bool jump_to_first) {
             m_match_count_label.set_text(std::to_string(m_match_offsets.size()) +
                                           (m_match_offsets.size() == 1 ? " match" : " matches"));
         } catch (const InvalidPatternError&) {
-            m_find_entry.get_style_context()->add_class(GTK_STYLE_CLASS_ERROR);
+            m_find_entry.add_css_class("error");
             m_match_count_label.set_text("Invalid pattern");
         }
     } else {
@@ -1570,17 +1512,28 @@ void ShellSheet::redo() {
 }
 
 void ShellSheet::update_undo_redo_sensitivity() {
-    if (m_item_undo) m_item_undo->set_sensitive(!m_undo_stack.empty());
-    if (m_item_redo) m_item_redo->set_sensitive(!m_redo_stack.empty());
+    if (m_action_undo) m_action_undo->set_enabled(!m_undo_stack.empty());
+    if (m_action_redo) m_action_redo->set_enabled(!m_redo_stack.empty());
 }
 
 void ShellSheet::on_menu_undo() { undo(); }
 void ShellSheet::on_menu_redo() { redo(); }
 
-bool ShellSheet::on_delete_event(GdkEventAny* /*any_event*/) {
-    // Returning true stops the close; false lets GTK's default handler hide
-    // the window (which, being the last window, ends the application).
-    return !prompt_save("closing");
+bool ShellSheet::on_close_request() {
+    // GTK4 cannot block for an answer, so a close that needs one is vetoed
+    // (return true), and re-issued from the callback once the user has
+    // decided. m_closing_confirmed is what stops that second close() from
+    // asking all over again.
+    if (m_closing_confirmed || !m_is_modified) {
+        return false; // let it close
+    }
+
+    prompt_save("closing", [this](bool proceed) {
+        if (!proceed) return;
+        m_closing_confirmed = true;
+        close();
+    });
+    return true; // veto this attempt
 }
 
 void ShellSheet::on_menu_quit() {
@@ -1591,7 +1544,8 @@ void ShellSheet::on_menu_quit() {
 }
 
 void ShellSheet::on_menu_new() {
-    if (prompt_save("starting a new document")) {
+    prompt_save("starting a new document", [this](bool proceed) {
+        if (!proceed) return;
         m_force_new_undo_group = true;
         m_text_buffer->set_text("");
         m_current_file = "";
@@ -1602,58 +1556,77 @@ void ShellSheet::on_menu_new() {
         m_redo_stack.clear();
         update_undo_redo_sensitivity();
         update_window_title();
-    }
+    });
 }
 
 void ShellSheet::on_menu_open() {
-    if (prompt_save("opening another file")) {
-        Gtk::FileChooserDialog dialog(*this, "Please choose a file", Gtk::FILE_CHOOSER_ACTION_OPEN);
-        dialog.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
-        dialog.add_button("_Open", Gtk::RESPONSE_OK);
+    prompt_save("opening another file", [this](bool proceed) {
+        if (!proceed) return;
 
-        int result = dialog.run();
-        if (result == Gtk::RESPONSE_OK) {
-            std::string filename = dialog.get_filename();
-            std::ifstream file(filename);
-            if (file.is_open()) {
-                std::stringstream buffer;
-                buffer << file.rdbuf();
-                m_force_new_undo_group = true;
-                m_text_buffer->set_text(buffer.str());
-                m_current_file = filename;
-                m_is_modified = false;
-                // Loading starts a fresh undo history - undoing back into a
-                // different file's content would be confusing, not useful.
-                m_undo_stack.clear();
-                m_redo_stack.clear();
-                update_undo_redo_sensitivity();
-                update_window_title();
+        auto dialog = Gtk::FileDialog::create();
+        dialog->set_title("Please choose a file");
+        dialog->open(*this, [this, dialog](const Glib::RefPtr<Gio::AsyncResult>& result) {
+            Glib::RefPtr<Gio::File> file;
+            try {
+                file = dialog->open_finish(result);
+            } catch (const Glib::Error&) {
+                return; // cancelled, or nothing chosen
             }
-        }
+            if (!file) return;
+
+            std::ifstream in(file->get_path());
+            if (!in.is_open()) return;
+            std::stringstream buffer;
+            buffer << in.rdbuf();
+
+            m_force_new_undo_group = true;
+            m_text_buffer->set_text(buffer.str());
+            m_current_file = file->get_path();
+            m_is_modified = false;
+            // Loading starts a fresh undo history - undoing back into a
+            // different file's content would be confusing, not useful.
+            m_undo_stack.clear();
+            m_redo_stack.clear();
+            update_undo_redo_sensitivity();
+            update_window_title();
+        });
+    });
+}
+
+bool ShellSheet::write_current_file() {
+    std::ofstream file(m_current_file);
+    if (!file.is_open()) return false;
+    file << m_text_buffer->get_text();
+    if (!file.good()) return false;
+    m_is_modified = false;
+    update_window_title();
+    return true;
+}
+
+void ShellSheet::save_document(const std::function<void(bool)>& done) {
+    if (!m_current_file.empty()) {
+        done(write_current_file());
+        return;
     }
+
+    auto dialog = Gtk::FileDialog::create();
+    dialog->set_title("Please choose a file to save");
+    dialog->save(*this, [this, dialog, done](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        Glib::RefPtr<Gio::File> file;
+        try {
+            file = dialog->save_finish(result);
+        } catch (const Glib::Error&) {
+            done(false); // cancelled: the changes are still unsaved
+            return;
+        }
+        if (!file) { done(false); return; }
+        m_current_file = file->get_path();
+        done(write_current_file());
+    });
 }
 
 void ShellSheet::on_menu_save() {
-    if (m_current_file.empty()) {
-        Gtk::FileChooserDialog dialog(*this, "Please choose a file to save", Gtk::FILE_CHOOSER_ACTION_SAVE);
-        dialog.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
-        dialog.add_button("_Save", Gtk::RESPONSE_OK);
-        dialog.set_do_overwrite_confirmation(true);
-
-        int result = dialog.run();
-        if (result == Gtk::RESPONSE_OK) {
-            m_current_file = dialog.get_filename();
-        } else {
-            return;
-        }
-    }
-
-    std::ofstream file(m_current_file);
-    if (file.is_open()) {
-        file << m_text_buffer->get_text();
-        m_is_modified = false;
-        update_window_title();
-    }
+    save_document([](bool) {});
 }
 
 std::pair<std::string, std::string> ShellSheet::get_version_info() {
@@ -1661,10 +1634,11 @@ std::pair<std::string, std::string> ShellSheet::get_version_info() {
 }
 
 void ShellSheet::on_menu_about() {
-    std::string message = "By: Justin Sloan\nLicense: MIT\nBuild: " + BUILD_NUMBER;
-    Gtk::MessageDialog dialog(*this, "About Shell Sheet", false, Gtk::MESSAGE_INFO, Gtk::BUTTONS_OK);
-    dialog.set_secondary_text(message);
-    dialog.run();
+    auto dialog = Gtk::AlertDialog::create();
+    dialog->set_message("About Shell Sheet");
+    dialog->set_detail("By: Justin Sloan\nLicense: MIT\nBuild: " + BUILD_NUMBER);
+    dialog->set_buttons({"_OK"});
+    dialog->show(*this);
 }
 
 void ShellSheet::on_menu_terminal() {
@@ -1918,7 +1892,7 @@ void ShellSheet::run_current_line(bool force_terminal) {
         m_running_command = cmd_text;
         update_running_indicator();
         m_command_output_fd = pipe_out[0];
-        // Kept open (instead of closed) so on_key_press() can forward typed
+        // Kept open (instead of closed) so on_key_pressed() can forward typed
         // lines to the running command's stdin - e.g. answering apt's "Do
         // you want to continue? [Y/n]" prompt.
         m_command_stdin_fd = pipe_in[1];
@@ -1940,7 +1914,7 @@ void ShellSheet::run_current_line(bool force_terminal) {
         m_io_conn = Glib::signal_io().connect(
             sigc::mem_fun(*this, &ShellSheet::on_command_output_received),
             m_command_output_fd,
-            Glib::IO_IN | Glib::IO_HUP | Glib::IO_ERR
+            Glib::IOCondition::IO_IN | Glib::IOCondition::IO_HUP | Glib::IOCondition::IO_ERR
         );
 
         // Reap the child through glib's SIGCHLD machinery so it never lingers as a zombie.
@@ -1960,7 +1934,7 @@ void ShellSheet::on_menu_terminate() {
 // Closes the write end of the running command's stdin pipe, delivering EOF
 // to it - the equivalent of Ctrl+D at a real terminal. Needed for commands
 // that read until stdin closes rather than waiting for a line (cat without
-// arguments, python3's REPL, sort, ...); on_key_press() alone can only ever
+// arguments, python3's REPL, sort, ...); on_key_pressed() alone can only ever
 // send lines, never signal "no more input is coming."
 void ShellSheet::on_menu_send_eof() {
     if (m_command_stdin_fd >= 0) {
@@ -1989,16 +1963,16 @@ void ShellSheet::on_menu_cut() {
     if (m_text_buffer->get_selection_bounds(start, end)) {
         m_force_new_undo_group = true;
     }
-    m_text_buffer->cut_clipboard(Gtk::Clipboard::get());
+    m_text_buffer->cut_clipboard(m_text_view.get_clipboard());
 }
 
 void ShellSheet::on_menu_copy() {
-    m_text_buffer->copy_clipboard(Gtk::Clipboard::get());
+    m_text_buffer->copy_clipboard(m_text_view.get_clipboard());
 }
 
 void ShellSheet::on_menu_paste() {
     m_force_new_undo_group = true;
-    m_text_buffer->paste_clipboard(Gtk::Clipboard::get());
+    m_text_buffer->paste_clipboard(m_text_view.get_clipboard());
 }
 
 void ShellSheet::on_menu_select_all() {
@@ -2066,43 +2040,48 @@ void ShellSheet::on_menu_hosts() {
     }
 }
 
-bool ShellSheet::prompt_save(const char* action_description) {
+void ShellSheet::prompt_save(const char* action_description,
+                              const std::function<void(bool)>& proceed) {
     if (!m_is_modified) {
-        return true;
+        proceed(true);
+        return;
     }
 
     std::string document = m_current_file.empty()
         ? "this document"
         : Glib::path_get_basename(m_current_file);
 
-    Gtk::MessageDialog dialog(*this,
-                               "Save changes to " + document + " before " +
-                                   action_description + "?",
-                               false, Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE);
-    dialog.set_secondary_text("If you don't save, your changes will be permanently lost.");
+    auto dialog = Gtk::AlertDialog::create();
+    dialog->set_message("Save changes to " + document + " before " +
+                         action_description + "?");
+    dialog->set_detail("If you don't save, your changes will be permanently lost.");
 
-    // Three buttons, not Yes/No. With only Yes/No there is no visible way to
-    // back out of a quit at all - the "cancel" path exists but is reachable
-    // only by guessing that Escape works.
-    dialog.add_button("Close _without Saving", Gtk::RESPONSE_NO);
-    dialog.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
-    dialog.add_button("_Save", Gtk::RESPONSE_YES);
-    dialog.set_default_response(Gtk::RESPONSE_YES);
+    // Three buttons, not two. With only save/discard there is no visible way
+    // to back out of a quit at all - the "cancel" path would exist but be
+    // reachable only by guessing that Escape works.
+    dialog->set_buttons({"Close _without Saving", "_Cancel", "_Save"});
+    dialog->set_cancel_button(1);  // Escape and the window close button
+    dialog->set_default_button(2); // Enter
 
-    int result = dialog.run();
+    dialog->choose(*this, [this, dialog, proceed](const Glib::RefPtr<Gio::AsyncResult>& result) {
+        int button = 1; // treat any failure as Cancel: never discard by accident
+        try {
+            button = dialog->choose_finish(result);
+        } catch (const Glib::Error&) {
+            button = 1;
+        }
 
-    if (result == Gtk::RESPONSE_YES) {
-        on_menu_save();
-        // Saving can still be abandoned (Cancel in the file chooser, or an
-        // unwritable path), and in that case the changes are still unsaved -
-        // so the caller must not go ahead and discard them.
-        return !m_is_modified;
-    }
-    if (result == Gtk::RESPONSE_NO) {
-        return true; // discard deliberately
-    }
-    // Cancel, Escape, or the dialog's own close button: abort the action.
-    return false;
+        if (button == 0) {
+            proceed(true);  // discard deliberately
+        } else if (button == 2) {
+            // Saving can still be abandoned (Cancel in the file chooser, or
+            // an unwritable path), and then the changes are still unsaved -
+            // so the caller must not go ahead and discard them.
+            save_document(proceed);
+        } else {
+            proceed(false); // Cancel / Escape
+        }
+    });
 }
 
 void ShellSheet::update_window_title() {
@@ -2164,7 +2143,7 @@ bool ShellSheet::flush_output_buffer() {
     m_force_new_undo_group = true;
     m_text_buffer->insert(insert_pos, sanitize_for_buffer(block));
     // Pending typed-but-not-yet-submitted input, if any, starts fresh after
-    // this newly-arrived output (see on_key_press).
+    // this newly-arrived output (see on_key_pressed).
     m_text_buffer->move_mark(m_input_mark, m_command_mark->get_iter());
 
     m_line_number_area.queue_draw();
@@ -2174,7 +2153,7 @@ bool ShellSheet::flush_output_buffer() {
 bool ShellSheet::on_command_output_received(Glib::IOCondition condition) {
     if (m_command_output_fd < 0) return false;
 
-    if (condition & Glib::IO_IN) {
+    if ((condition & Glib::IOCondition::IO_IN) == Glib::IOCondition::IO_IN) {
         char buffer[4096];
         ssize_t bytes_read = ::read(m_command_output_fd, buffer, sizeof(buffer) - 1);
         if (bytes_read > 0) {

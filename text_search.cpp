@@ -21,9 +21,9 @@ std::vector<SearchMatch> find_matches(const std::string& text,
     Glib::RefPtr<Glib::Regex> regex;
     try {
         regex = Glib::Regex::create(
-            effective_pattern,
-            options.case_sensitive ? static_cast<Glib::RegexCompileFlags>(0)
-                                    : Glib::REGEX_CASELESS);
+            effective_pattern.c_str(),
+            options.case_sensitive ? static_cast<Glib::Regex::CompileFlags>(0)
+                                    : Glib::Regex::CompileFlags::CASELESS);
     } catch (const Glib::RegexError& e) {
         throw InvalidPatternError(e.what());
     }
@@ -36,7 +36,7 @@ std::vector<SearchMatch> find_matches(const std::string& text,
         int pos = 0;
         while (pos <= len) {
             Glib::MatchInfo match_info;
-            if (!regex->match(line, pos, match_info)) {
+            if (!regex->match(line.c_str(), pos, match_info)) {
                 break;
             }
             int start = 0, end = 0;

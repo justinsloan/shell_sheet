@@ -5,12 +5,13 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace {
 
 // Invoked instead of the normal editor when SHELL_SHEET_ASKPASS is set in
-// the environment. shell_sheet.cpp's on_menu_terminal() sets that (plus
+// the environment. shell_sheet.cpp's run_current_line() sets that (plus
 // SUDO_ASKPASS pointing back at this same binary) on any command it runs
 // through sudo, so sudo calls back into us just for the password prompt.
 // The contract for an askpass helper is simple: print the entered password
@@ -25,40 +26,66 @@ int run_sudo_askpass() {
     // and activate() never runs - so the dialog never appears, and sudo
     // sees no password at all ("Authentication required but not
     // attempted"). Passing no arguments sidesteps that entirely.
-    int argc = 0;
-    char** argv = nullptr;
+    //
     // NON_UNIQUE: each invocation must show and answer its own prompt
     // independently, never be forwarded to some other already-running
     // instance of this helper (or of the main editor).
-    auto app = Gtk::Application::create(argc, argv, "com.justin.shellsheet.askpass",
-                                         Gio::APPLICATION_NON_UNIQUE);
+    auto app = Gtk::Application::create("com.justin.shellsheet.askpass",
+                                         Gio::Application::Flags::NON_UNIQUE);
     int exit_code = 1;
 
-    app->signal_activate().connect([&]() {
-        Gtk::Dialog dialog("Sudo Authentication Required", true);
-        Gtk::Entry password_entry;
-        password_entry.set_visibility(false);
-        password_entry.set_placeholder_text("Enter sudo password");
-        // Enter submits, the way every other password prompt behaves.
-        // Both halves are needed: set_activates_default makes Enter in the
-        // entry activate the dialog's default widget, and
-        // set_default_response is what makes OK that widget.
-        password_entry.set_activates_default(true);
-        dialog.get_content_area()->pack_start(password_entry, true, true, 10);
-        dialog.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
-        dialog.add_button("_OK", Gtk::RESPONSE_OK);
-        dialog.set_default_response(Gtk::RESPONSE_OK);
-        dialog.show_all_children();
-        // Type straight into the entry without clicking it first.
-        password_entry.grab_focus();
+    // Outlives the activate handler, which only builds and shows the window.
+    std::unique_ptr<Gtk::Window> window;
 
-        if (dialog.run() == Gtk::RESPONSE_OK) {
-            std::string password = password_entry.get_text();
+    app->signal_activate().connect([&]() {
+        window = std::make_unique<Gtk::Window>();
+        window->set_title("Sudo Authentication Required");
+        window->set_modal(true);
+        window->set_resizable(false);
+
+        auto* layout = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 10);
+        layout->set_margin(12);
+
+        auto* prompt = Gtk::make_managed<Gtk::Label>("Enter sudo password");
+        prompt->set_xalign(0.0f);
+
+        auto* password_entry = Gtk::make_managed<Gtk::Entry>();
+        password_entry->set_visibility(false);
+        password_entry->set_placeholder_text("Enter sudo password");
+        // Enter submits, the way every other password prompt behaves. Both
+        // halves are needed: set_activates_default makes Enter activate the
+        // window's default widget, and set_default_widget makes OK that
+        // widget.
+        password_entry->set_activates_default(true);
+
+        auto* buttons = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 6);
+        buttons->set_halign(Gtk::Align::END);
+        auto* cancel_button = Gtk::make_managed<Gtk::Button>("_Cancel", true);
+        auto* ok_button = Gtk::make_managed<Gtk::Button>("_OK", true);
+        buttons->append(*cancel_button);
+        buttons->append(*ok_button);
+
+        layout->append(*prompt);
+        layout->append(*password_entry);
+        layout->append(*buttons);
+        window->set_child(*layout);
+
+        window->set_default_widget(*ok_button);
+
+        ok_button->signal_clicked().connect([&exit_code, password_entry, &app]() {
+            std::string password = password_entry->get_text();
             std::cout << password << std::endl;
             std::fill(password.begin(), password.end(), '\0');
             exit_code = 0;
-        }
-        app->quit();
+            app->quit();
+        });
+        cancel_button->signal_clicked().connect([&app]() { app->quit(); });
+        // Closing the window is a cancel, same as the button.
+        window->signal_close_request().connect([&app]() { app->quit(); return false; }, false);
+
+        app->add_window(*window);
+        window->present();
+        password_entry->grab_focus();
     });
 
     app->run();
@@ -69,7 +96,11 @@ int run_sudo_askpass() {
 // (g_unix_signal_add's callback runs as a normal main-loop source, so unlike
 // a raw signal() handler it's safe to call arbitrary code here). Sends
 // SIGTERM to any currently-running command so it isn't left orphaned when
-// the app closes, then closes the window the same way File > Quit does.
+// the app closes, then hides the window.
+//
+// Deliberately hides rather than close()s: close() would run the
+// unsaved-changes prompt, and blocking a logout on a modal dialog nobody
+// may be able to see is worse than losing the prompt.
 //
 // This can never catch SIGKILL ("kill -9"): that signal is intentionally
 // uncatchable by any process, by design. A command killed that way is
@@ -79,7 +110,7 @@ int run_sudo_askpass() {
 gboolean handle_termination_signal(gpointer user_data) {
     auto* window = static_cast<ShellSheet*>(user_data);
     window->terminate_running_command();
-    window->hide();
+    window->set_visible(false);
     return G_SOURCE_REMOVE;
 }
 
@@ -87,19 +118,29 @@ gboolean handle_termination_signal(gpointer user_data) {
 
 int main(int argc, char* argv[]) {
     // Writing a typed line to a running command's stdin (see
-    // ShellSheet::on_key_press) can hit a closed pipe if that command isn't
+    // ShellSheet::on_key_pressed) can hit a closed pipe if that command isn't
     // reading stdin, or already exited. Without this, that write raises
     // SIGPIPE and kills the whole app; with it, the write just fails and we
-    // ignore the failure.
+    // ignore the failure. Child processes reset it to the default before
+    // exec, so this never leaks into the user's commands.
     std::signal(SIGPIPE, SIG_IGN);
 
     if (std::getenv("SHELL_SHEET_ASKPASS")) {
         return run_sudo_askpass();
     }
 
-    auto app = Gtk::Application::create(argc, argv, "com.justin.shellsheet");
-    ShellSheet window;
-    g_unix_signal_add(SIGTERM, handle_termination_signal, &window);
-    g_unix_signal_add(SIGINT, handle_termination_signal, &window);
-    return app->run(window);
+    auto app = Gtk::Application::create("com.justin.shellsheet");
+
+    std::unique_ptr<ShellSheet> window;
+    app->signal_activate().connect([&]() {
+        window = std::make_unique<ShellSheet>();
+        app->add_window(*window);
+        // Wired here rather than in the constructor so the handlers are
+        // installed exactly once, against a window that is about to be shown.
+        g_unix_signal_add(SIGTERM, handle_termination_signal, window.get());
+        g_unix_signal_add(SIGINT, handle_termination_signal, window.get());
+        window->present();
+    });
+
+    return app->run(argc, argv);
 }

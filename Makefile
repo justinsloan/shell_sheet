@@ -1,6 +1,6 @@
 CXX = g++
-CXXFLAGS = -Wall -Wextra -std=c++17 $(shell pkg-config --cflags gtkmm-3.0)
-LDFLAGS = $(shell pkg-config --libs gtkmm-3.0)
+CXXFLAGS = -Wall -Wextra -std=c++17 $(shell pkg-config --cflags gtkmm-4.0)
+LDFLAGS = $(shell pkg-config --libs gtkmm-4.0)
 TARGET = shell_sheet
 SRCS = main.cpp shell_sheet.cpp syntax_highlight.cpp text_search.cpp text_transforms.cpp undo_stack.cpp directory_tracking.cpp terminal_launch.cpp
 OBJS = $(SRCS:.cpp=.o)
@@ -46,7 +46,7 @@ $(TRANSFORMS_TEST_TARGET): tests/test_text_transforms.cpp text_transforms.cpp te
 	$(CXX) -Wall -Wextra -std=c++17 tests/test_text_transforms.cpp text_transforms.cpp -o $(TRANSFORMS_TEST_TARGET)
 
 $(SEARCH_TEST_TARGET): tests/test_text_search.cpp text_search.cpp text_search.h
-	$(CXX) -Wall -Wextra -std=c++17 $(shell pkg-config --cflags glibmm-2.4) tests/test_text_search.cpp text_search.cpp -o $(SEARCH_TEST_TARGET) $(shell pkg-config --libs glibmm-2.4)
+	$(CXX) -Wall -Wextra -std=c++17 $(shell pkg-config --cflags glibmm-2.68) tests/test_text_search.cpp text_search.cpp -o $(SEARCH_TEST_TARGET) $(shell pkg-config --libs glibmm-2.68)
 
 $(UNDO_TEST_TARGET): tests/test_undo_stack.cpp undo_stack.cpp undo_stack.h
 	$(CXX) -Wall -Wextra -std=c++17 tests/test_undo_stack.cpp undo_stack.cpp -o $(UNDO_TEST_TARGET)

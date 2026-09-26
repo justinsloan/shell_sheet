@@ -18,6 +18,7 @@
 // the mark has already caught up to the end of the buffer and the
 // "captured" line comes out empty every time.
 #include <gtkmm.h>
+#include <gtkmm/init.h>
 
 #include <cassert>
 #include <iostream>
@@ -34,9 +35,12 @@ void expect(bool cond, const std::string& what) {
 } // namespace
 
 int main() {
-    int argc = 0;
-    char** argv = nullptr;
-    Gtk::Main kit(argc, argv); // initializes GTK synchronously; no main loop needed below
+    // GTK4 removed Gtk::Main. gtk_init() brings up the C library, but the
+    // gtkmm C++ wrappers need registering separately - without that second
+    // call, wrapping a GtkTextMark fails and the process segfaults. No main
+    // loop is needed for any of the checks below.
+    gtk_init();
+    Gtk::init_gtkmm_internals();
 
     auto buffer = Gtk::TextBuffer::create();
 
@@ -125,26 +129,20 @@ int main() {
 
     // --- the line-number gutter's font mechanism ---
     //
-    // The gutter draws its numbers with a Pango layout using the font
-    // description it reads back off the TextView's style context. That
-    // indirection is the whole reason the numbers track the editor text
-    // when the zoom changes, so pin it down: change the CSS font size, and
-    // a layout built from the resolved description must change size too.
-    Gtk::Window font_win;
+    // The gutter draws its numbers with a Pango layout built from the same
+    // family and size that the editor's CSS uses, which is what keeps the
+    // two in step when the zoom changes. Under GTK3 this test read the font
+    // back off the TextView's style context; GTK4 removed
+    // StyleContext::get_font(), and ShellSheet::text_view_font() now builds
+    // the description directly - so this mirrors that, and still pins down
+    // the property that matters: a bigger size must measure wider.
     Gtk::TextView font_tv;
-    font_win.add(font_tv);
-    font_win.show_all();
-
-    auto font_css = Gtk::CssProvider::create();
-    Gtk::StyleContext::add_provider_for_screen(Gdk::Screen::get_default(), font_css,
-                                                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     auto width_at = [&](int points) {
-        font_css->load_from_data("textview { font-family: monospace; font-size: " +
-                                  std::to_string(points) + "pt; }");
+        Pango::FontDescription font("monospace");
+        font.set_size(points * PANGO_SCALE);
         auto layout = font_tv.create_pango_layout("1234567890");
-        layout->set_font_description(
-            font_tv.get_style_context()->get_font(Gtk::STATE_FLAG_NORMAL));
+        layout->set_font_description(font);
         int w = 0, h = 0;
         layout->get_pixel_size(w, h);
         return w;
@@ -157,8 +155,6 @@ int main() {
            "line numbers measure wider as the editor font size grows");
     expect(width_at(9) == small,
            "...and measure back to the same width on the way down");
-
-    Gtk::StyleContext::remove_provider_for_screen(Gdk::Screen::get_default(), font_css);
 
     if (g_failures > 0) {
         std::cout << g_failures << " test(s) failed\n";

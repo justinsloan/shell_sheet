@@ -10,7 +10,7 @@ one editable buffer you can search, transform and save, which makes it a
 useful place to work out a sequence of commands, keep the output alongside
 them, and hand the result to someone else.
 
-It's modelled on BBEdit's Unix Worksheet. Written in C++17 and gtkmm-3.
+It's modelled on BBEdit's Unix Worksheet. Written in C++17 and gtkmm-4.
 
 ```
 #!/bin/bash
@@ -51,11 +51,11 @@ duplicate/move lines, hard wrap, tabs↔spaces, line endings, trim).
 
 ## Building
 
-Needs a C++17 compiler and gtkmm-3.0.
+Needs a C++17 compiler and gtkmm-4.0.
 
 ```bash
-sudo apt install build-essential libgtkmm-3.0-dev   # Debian / Ubuntu
-sudo dnf install gcc-c++ gtkmm30-devel              # Fedora
+sudo apt install build-essential libgtkmm-4.0-dev   # Debian / Ubuntu
+sudo dnf install gcc-c++ gtkmm4.0-devel             # Fedora
 
 make
 ./shell_sheet

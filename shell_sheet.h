@@ -29,12 +29,13 @@ public:
 
 protected:
     // UI Components
-    Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL};
-    Gtk::MenuBar m_menu_bar;
+    Gtk::Box m_vbox{Gtk::Orientation::VERTICAL};
+    // Built from a Gio::Menu model in setup_menu(); owned by m_vbox.
+    Gtk::PopoverMenuBar* m_menu_bar = nullptr;
     Gtk::ScrolledWindow m_scrolled_window;
     Gtk::TextView m_text_view;
     Gtk::DrawingArea m_line_number_area;
-    Gtk::Paned m_paned{Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Paned m_paned{Gtk::Orientation::HORIZONTAL};
 
     // Editor font. The size is in points (CSS pt), applied to the TextView
     // through m_font_provider; the line-number gutter reads the TextView's
@@ -154,7 +155,7 @@ protected:
     void on_menu_zoom_out();
     void on_menu_zoom_reset();
     void on_menu_toggle_cwd_bar();
-    void on_menu_wrap_mode_changed();
+    void on_menu_wrap_mode_changed(const Glib::ustring& mode);
     void on_menu_find();
     void on_menu_find_next();
     void on_menu_find_previous();
@@ -178,17 +179,31 @@ protected:
     void on_transform_line_ending_cr();
 
     // Helpers
-    // Offers to save when the buffer is dirty, and reports whether the
-    // caller may proceed with whatever it was about to do. Returns false
-    // only when the user actively backed out (Cancel/Escape) or when Save
-    // was chosen but did not succeed - in both cases the pending action
-    // must be abandoned, not carried out. `action_description` completes
-    // the sentence "Save changes to <file> before ...?".
-    bool prompt_save(const char* action_description = "continuing");
+    // Offers to save when the buffer is dirty, then hands the answer to
+    // `proceed`: true to carry on with whatever the caller was about to do,
+    // false when the user backed out (Cancel) or chose Save and the save did
+    // not happen. `action_description` completes the sentence "Save changes
+    // to <file> before ...?".
+    //
+    // Asynchronous, and it has to be: GTK4 removed Dialog::run(), so nothing
+    // can block waiting for an answer. Every caller therefore continues
+    // inside the callback rather than after the call.
+    void prompt_save(const char* action_description,
+                      const std::function<void(bool)>& proceed);
+    // Saves, asking for a filename first if there isn't one, then reports
+    // whether the file actually got written. Asynchronous for the same
+    // reason prompt_save is: the file chooser cannot be waited on.
+    void save_document(const std::function<void(bool)>& done);
+    // The write itself, once a path is known. Returns false if it failed.
+    bool write_current_file();
+    // Set while a close is being re-issued from prompt_save's callback, so
+    // on_close_request() lets that second attempt through instead of asking
+    // again and looping forever.
+    bool m_closing_confirmed = false;
 
-    // Vetoes a window close (X button, or File > Quit, which routes here
-    // via close()) while there are unsaved changes the user wants to keep.
-    bool on_delete_event(GdkEventAny* any_event) override;
+    // Vetoes a window close (X button, or File > Quit) while there are
+    // unsaved changes, then re-issues it once the user has answered.
+    bool on_close_request() override;
     std::pair<std::string, std::string> get_version_info();
     void update_window_title();
     bool flush_output_buffer();
@@ -197,9 +212,12 @@ protected:
     // Appends a one-line status notice (e.g. "Terminated") after a
     // command's output, starting a new line first if the output didn't.
     void append_status_line(const std::string& text);
-    bool on_line_number_area_draw(const Cairo::RefPtr<Cairo::Context>& cr);
-    // The font the TextView is actually rendering with, resolved from its
-    // style context. The gutter draws its numbers with this same
+    void on_line_number_area_draw(const Cairo::RefPtr<Cairo::Context>& cr,
+                                   int width, int height);
+    // The font the TextView is rendering with. GTK4 removed
+    // StyleContext::get_font(), so this is built from the same family and
+    // size that apply_font_size() writes into the CSS rather than read back
+    // out of the widget. The gutter draws its numbers with this exact
     // description, which is what keeps the two aligned at every size.
     Pango::FontDescription text_view_font() const;
     // Clamps to [kMinFontSize, kMaxFontSize] and re-applies if it changed.
@@ -214,7 +232,8 @@ protected:
     void on_text_buffer_changed();
     void on_scroll_changed();
     void update_syntax_highlighting();
-    bool on_key_press(GdkEventKey* event);
+    // Attached to the TextView through a Gtk::EventControllerKey.
+    bool on_key_pressed(guint keyval, guint keycode, Gdk::ModifierType state);
     void setup_search_bar();
     void setup_cwd_bar();
     void setup_running_bar();
@@ -286,38 +305,24 @@ protected:
     void update_undo_redo_sensitivity();
 
 private:
-    // Menu items kept as members to allow for accelerators
-    Gtk::MenuItem* m_item_undo = nullptr;
-    Gtk::MenuItem* m_item_redo = nullptr;
-    Gtk::MenuItem* m_item_new = nullptr;
-    Gtk::MenuItem* m_item_open = nullptr;
-    Gtk::MenuItem* m_item_save = nullptr;
-    Gtk::MenuItem* m_item_quit = nullptr;
-    Gtk::MenuItem* m_item_terminal = nullptr;
-    Gtk::MenuItem* m_item_terminal_window = nullptr;
-    Gtk::MenuItem* m_item_send_eof = nullptr;
-    Gtk::MenuItem* m_item_terminate = nullptr;
-    Gtk::MenuItem* m_item_cut = nullptr;
-    Gtk::MenuItem* m_item_copy = nullptr;
-    Gtk::MenuItem* m_item_paste = nullptr;
-    Gtk::MenuItem* m_item_select_all = nullptr;
-    Gtk::MenuItem* m_item_select_line = nullptr;
-    Gtk::MenuItem* m_item_zoom_in = nullptr;
-    Gtk::MenuItem* m_item_zoom_out = nullptr;
-    Gtk::MenuItem* m_item_zoom_reset = nullptr;
-    Gtk::CheckMenuItem* m_item_show_cwd = nullptr;
-    Gtk::RadioMenuItem* m_item_no_wrap = nullptr;
-    Gtk::RadioMenuItem* m_item_soft_wrap = nullptr;
-    Gtk::MenuItem* m_item_about = nullptr;
-    Gtk::MenuItem* m_item_find = nullptr;
-    Gtk::MenuItem* m_item_find_next = nullptr;
-    Gtk::MenuItem* m_item_find_previous = nullptr;
-    Gtk::MenuItem* m_item_replace = nullptr;
+    // GTK4 has no Gtk::MenuItem: the menu is a Gio::Menu model rendered by
+    // a Gtk::PopoverMenuBar, and every entry activates a Gio::Action. Only
+    // the actions whose state or sensitivity changes at runtime need to be
+    // held on to.
+    Glib::RefPtr<Gio::SimpleActionGroup> m_actions;
+    Glib::RefPtr<Gio::SimpleAction> m_action_undo;
+    Glib::RefPtr<Gio::SimpleAction> m_action_redo;
+    Glib::RefPtr<Gio::SimpleAction> m_action_show_cwd;
+    Glib::RefPtr<Gio::SimpleAction> m_action_wrap;
+
+    // Key handling is a controller in GTK4, not a widget signal.
+    Glib::RefPtr<Gtk::EventControllerKey> m_key_controller;
 
     void setup_ui_layout();
     void apply_css();
     void setup_menu();
-    void setup_shortcuts();
+    // Registers every Gio::Action and its keyboard accelerator.
+    void setup_actions();
 };
 
 #endif // SHELL_SHEET_H
