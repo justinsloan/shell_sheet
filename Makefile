@@ -2,7 +2,7 @@ CXX = g++
 CXXFLAGS = -Wall -Wextra -std=c++17 $(shell pkg-config --cflags gtkmm-4.0)
 LDFLAGS = $(shell pkg-config --libs gtkmm-4.0)
 TARGET = shell_sheet
-SRCS = main.cpp shell_sheet.cpp syntax_highlight.cpp text_search.cpp text_transforms.cpp undo_stack.cpp directory_tracking.cpp terminal_launch.cpp
+SRCS = main.cpp shell_sheet.cpp syntax_highlight.cpp text_search.cpp text_transforms.cpp undo_stack.cpp directory_tracking.cpp terminal_launch.cpp shortcuts.cpp
 OBJS = $(SRCS:.cpp=.o)
 TEST_TARGET = tests/test_syntax_highlight
 TRANSFORMS_TEST_TARGET = tests/test_text_transforms
@@ -10,6 +10,7 @@ SEARCH_TEST_TARGET = tests/test_text_search
 UNDO_TEST_TARGET = tests/test_undo_stack
 DIRTRACK_TEST_TARGET = tests/test_directory_tracking
 TERMLAUNCH_TEST_TARGET = tests/test_terminal_launch
+SHORTCUTS_TEST_TARGET = tests/test_shortcuts
 MARKS_TEST_TARGET = tests/test_marks
 
 all: $(TARGET)
@@ -31,13 +32,14 @@ $(TARGET): $(OBJS)
 # still no GTK widgets or display, so it stays just as fast/headless-safe
 # and is bundled in here rather than alongside the display-requiring
 # test-marks target below.
-test: $(TEST_TARGET) $(TRANSFORMS_TEST_TARGET) $(SEARCH_TEST_TARGET) $(UNDO_TEST_TARGET) $(DIRTRACK_TEST_TARGET) $(TERMLAUNCH_TEST_TARGET)
+test: $(TEST_TARGET) $(TRANSFORMS_TEST_TARGET) $(SEARCH_TEST_TARGET) $(UNDO_TEST_TARGET) $(DIRTRACK_TEST_TARGET) $(TERMLAUNCH_TEST_TARGET) $(SHORTCUTS_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(TRANSFORMS_TEST_TARGET)
 	./$(SEARCH_TEST_TARGET)
 	./$(UNDO_TEST_TARGET)
 	./$(DIRTRACK_TEST_TARGET)
 	./$(TERMLAUNCH_TEST_TARGET)
+	./$(SHORTCUTS_TEST_TARGET)
 
 $(TEST_TARGET): tests/test_syntax_highlight.cpp syntax_highlight.cpp syntax_highlight.h
 	$(CXX) -Wall -Wextra -std=c++17 tests/test_syntax_highlight.cpp syntax_highlight.cpp -o $(TEST_TARGET)
@@ -57,6 +59,9 @@ $(DIRTRACK_TEST_TARGET): tests/test_directory_tracking.cpp directory_tracking.cp
 $(TERMLAUNCH_TEST_TARGET): tests/test_terminal_launch.cpp terminal_launch.cpp terminal_launch.h
 	$(CXX) -Wall -Wextra -std=c++17 tests/test_terminal_launch.cpp terminal_launch.cpp -o $(TERMLAUNCH_TEST_TARGET)
 
+$(SHORTCUTS_TEST_TARGET): tests/test_shortcuts.cpp shortcuts.cpp shortcuts.h
+	$(CXX) -Wall -Wextra -std=c++17 tests/test_shortcuts.cpp shortcuts.cpp -o $(SHORTCUTS_TEST_TARGET)
+
 # Regression test for the Gtk::TextMark gravity bug (see tests/test_marks.cpp).
 # Unlike `test` above, this genuinely needs GTK and a display (a real
 # session, or Xvfb) - it's checking real Gtk::TextBuffer/TextMark behavior,
@@ -69,6 +74,6 @@ $(MARKS_TEST_TARGET): tests/test_marks.cpp
 	$(CXX) $(CXXFLAGS) tests/test_marks.cpp -o $(MARKS_TEST_TARGET) $(LDFLAGS)
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_TARGET) $(TRANSFORMS_TEST_TARGET) $(SEARCH_TEST_TARGET) $(UNDO_TEST_TARGET) $(DIRTRACK_TEST_TARGET) $(TERMLAUNCH_TEST_TARGET) $(MARKS_TEST_TARGET)
+	rm -f $(OBJS) $(TARGET) $(TEST_TARGET) $(TRANSFORMS_TEST_TARGET) $(SEARCH_TEST_TARGET) $(UNDO_TEST_TARGET) $(DIRTRACK_TEST_TARGET) $(TERMLAUNCH_TEST_TARGET) $(SHORTCUTS_TEST_TARGET) $(MARKS_TEST_TARGET)
 
 .PHONY: all rebuild clean test test-marks

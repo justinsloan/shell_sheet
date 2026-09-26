@@ -7,11 +7,13 @@
 #include <string>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include "directory_tracking.h"
 #include "terminal_launch.h"
+#include "shortcuts.h"
 #include "text_search.h"
 #include "text_transforms.h"
 #include "undo_stack.h"
@@ -143,9 +145,8 @@ protected:
     // Child watch for the launched emulator. Does nothing except let glib
     // reap it; nothing is running inside this app.
     void reap_launched_terminal(int pid, int status);
-    void on_menu_bashrc();
-    void on_menu_hosts();
     void on_menu_about();
+    void on_menu_shortcuts();
     void on_menu_cut();
     void on_menu_copy();
     void on_menu_paste();
@@ -204,7 +205,6 @@ protected:
     // Vetoes a window close (X button, or File > Quit) while there are
     // unsaved changes, then re-issues it once the user has answered.
     bool on_close_request() override;
-    std::pair<std::string, std::string> get_version_info();
     void update_window_title();
     bool flush_output_buffer();
     bool on_command_output_received(Glib::IOCondition condition);
@@ -317,6 +317,10 @@ private:
 
     // Key handling is a controller in GTK4, not a widget signal.
     Glib::RefPtr<Gtk::EventControllerKey> m_key_controller;
+
+    // Help windows, kept so reopening reuses one rather than stacking them.
+    std::unique_ptr<Gtk::Window> m_shortcuts_window;
+    std::unique_ptr<Gtk::AboutDialog> m_about_dialog;
 
     void setup_ui_layout();
     void apply_css();

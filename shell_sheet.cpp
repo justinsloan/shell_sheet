@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <cstring> // strsignal
+#include <map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <fstream>
@@ -265,7 +266,8 @@ void ShellSheet::setup_running_bar() {
     m_running_css_provider = CssProvider::create();
     m_running_css_provider->load_from_data(
         ".command-running-bar { background-color: #f5a623; padding: 4px 6px; }"
-        ".command-running-bar label { color: #ffffff; font-weight: bold; }");
+        ".command-running-bar label { color: #ffffff; font-weight: bold; }"
+        ".shortcut-keys { font-family: monospace; }");
     // Screen-scoped for the same reason the font provider is: a
     // widget-scoped provider is unreliable about actually taking effect.
     Gtk::StyleContext::add_provider_for_display(Gdk::Display::get_default(),
@@ -503,23 +505,23 @@ void ShellSheet::setup_actions() {
 
     // Help
     add("about", &ShellSheet::on_menu_about);
+    add("shortcuts", &ShellSheet::on_menu_shortcuts);
 
     // Accelerators belong to the application, not the window, in GTK4.
     auto app = std::dynamic_pointer_cast<Gtk::Application>(Gio::Application::get_default());
     if (!app) return;
 
-    app->set_accels_for_action("win.open", {"<Control>o"});
-    app->set_accels_for_action("win.save", {"<Control>s"});
-    app->set_accels_for_action("win.quit", {"<Control>q"});
-    app->set_accels_for_action("win.run", {"<Control>Return", "<Control>KP_Enter"});
-    app->set_accels_for_action("win.send-eof", {"<Control>d"});
-    app->set_accels_for_action("win.undo", {"<Control>z"});
-    app->set_accels_for_action("win.redo", {"<Control><Shift>z"});
-    app->set_accels_for_action("win.select-line", {"<Control>l"});
-    app->set_accels_for_action("win.find", {"<Control>f"});
-    app->set_accels_for_action("win.find-next", {"<Control>g"});
-    app->set_accels_for_action("win.find-previous", {"<Control><Shift>g"});
-    app->set_accels_for_action("win.replace", {"<Control>h"});
+    // Registered from the one table in shortcuts.h, so the Help window and
+    // the real bindings cannot drift apart. Grouped by action first because
+    // set_accels_for_action() replaces an action's whole list, and win.run
+    // has two (Ctrl+Enter and its keypad twin).
+    std::map<std::string, std::vector<Glib::ustring>> accels;
+    for (const ShortcutEntry& entry : shortcut_table()) {
+        if (entry.action) accels[entry.action].push_back(entry.accelerator);
+    }
+    for (const auto& [action_name, keys] : accels) {
+        app->set_accels_for_action(action_name, keys);
+    }
 
     // Deliberately NOT given accelerators, and handled in on_key_presseded()
     // instead: Ctrl+C (must still mean Copy unless a command is running),
@@ -630,6 +632,7 @@ void ShellSheet::setup_menu() {
     menu->append_submenu("_Terminal", terminal_menu);
 
     auto help_menu = Gio::Menu::create();
+    help_menu->append("_Keyboard Shortcuts (F1)", "win.shortcuts");
     help_menu->append("_About", "win.about");
     menu->append_submenu("_Help", help_menu);
 
@@ -1629,16 +1632,79 @@ void ShellSheet::on_menu_save() {
     save_document([](bool) {});
 }
 
-std::pair<std::string, std::string> ShellSheet::get_version_info() {
-    return {BUILD_NUMBER, ""};
-}
 
 void ShellSheet::on_menu_about() {
-    auto dialog = Gtk::AlertDialog::create();
-    dialog->set_message("About Shell Sheet");
-    dialog->set_detail("By: Justin Sloan\nLicense: MIT\nBuild: " + BUILD_NUMBER);
-    dialog->set_buttons({"_OK"});
-    dialog->show(*this);
+    if (!m_about_dialog) {
+        m_about_dialog = std::make_unique<Gtk::AboutDialog>();
+        m_about_dialog->set_program_name("Shell Sheet");
+        m_about_dialog->set_version("Build " + BUILD_NUMBER);
+        m_about_dialog->set_comments("A text editor where any line can be a shell command.");
+        m_about_dialog->set_copyright("Copyright \u00a9 2026 Justin Sloan");
+        m_about_dialog->set_license_type(Gtk::License::MIT_X11);
+        m_about_dialog->set_website("https://github.com/justinsloan/shell_sheet");
+        m_about_dialog->set_website_label("Project homepage");
+        m_about_dialog->set_authors({"Justin Sloan"});
+        m_about_dialog->set_transient_for(*this);
+        m_about_dialog->set_modal(true);
+        m_about_dialog->set_hide_on_close(true);
+    }
+    m_about_dialog->set_visible(true);
+}
+
+void ShellSheet::on_menu_shortcuts() {
+    if (!m_shortcuts_window) {
+        m_shortcuts_window = std::make_unique<Gtk::Window>();
+        m_shortcuts_window->set_title("Keyboard Shortcuts");
+        m_shortcuts_window->set_transient_for(*this);
+        // Deliberately NOT modal: this is a reference to consult while
+        // working, not a question to answer.
+        m_shortcuts_window->set_default_size(460, 560);
+        m_shortcuts_window->set_hide_on_close(true);
+
+        auto* content = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 18);
+        content->set_margin(18);
+
+        for (const std::string& group : shortcut_groups()) {
+            auto* heading = Gtk::make_managed<Gtk::Label>();
+            heading->set_markup("<b>" + Glib::Markup::escape_text(group) + "</b>");
+            heading->set_xalign(0.0f);
+
+            auto* grid = Gtk::make_managed<Gtk::Grid>();
+            grid->set_row_spacing(6);
+            grid->set_column_spacing(18);
+
+            int row = 0;
+            for (const ShortcutEntry& entry : shortcut_table()) {
+                // A row with no description is a registered alias, not
+                // something worth showing twice.
+                if (group != entry.group || !entry.description) continue;
+
+                auto* keys = Gtk::make_managed<Gtk::Label>(accelerator_label(entry.accelerator));
+                keys->set_xalign(1.0f);
+                // Gtk::ShortcutLabel would draw these as key caps, but it is
+                // deprecated along with the rest of the shortcuts-window
+                // family, so a monospace label carries the distinction.
+                keys->add_css_class("shortcut-keys");
+
+                auto* what = Gtk::make_managed<Gtk::Label>(entry.description);
+                what->set_xalign(0.0f);
+                what->set_hexpand(true);
+
+                grid->attach(*keys, 0, row);
+                grid->attach(*what, 1, row);
+                ++row;
+            }
+
+            content->append(*heading);
+            content->append(*grid);
+        }
+
+        auto* scroller = Gtk::make_managed<Gtk::ScrolledWindow>();
+        scroller->set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+        scroller->set_child(*content);
+        m_shortcuts_window->set_child(*scroller);
+    }
+    m_shortcuts_window->present();
 }
 
 void ShellSheet::on_menu_terminal() {
@@ -1996,49 +2062,7 @@ void ShellSheet::on_menu_select_line() {
     m_text_buffer->select_range(start, end);
 }
 
-void ShellSheet::on_menu_bashrc() {
-    std::string home = std::getenv("HOME") ? std::getenv("HOME") : "";
-    if (!home.empty()) {
-        std::string path = home + "/.bashrc";
-        std::ifstream file(path);
-        m_force_new_undo_group = true;
-        if (file.is_open()) {
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            m_text_buffer->set_text(buffer.str());
-            m_current_file = path;
-            m_is_modified = false;
-            update_window_title();
-        } else {
-            m_current_file = path;
-            m_text_buffer->set_text("");
-            m_is_modified = false;
-            update_window_title();
-        }
-        // Loading starts a fresh undo history, same as Open/New.
-        m_undo_stack.clear();
-        m_redo_stack.clear();
-        update_undo_redo_sensitivity();
-    }
-}
 
-void ShellSheet::on_menu_hosts() {
-    std::string path = "/etc/hosts";
-    std::ifstream file(path);
-    if (file.is_open()) {
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        m_force_new_undo_group = true;
-        m_text_buffer->set_text(buffer.str());
-        m_current_file = path;
-        m_is_modified = false;
-        // Loading starts a fresh undo history, same as Open/New.
-        m_undo_stack.clear();
-        m_redo_stack.clear();
-        update_undo_redo_sensitivity();
-        update_window_title();
-    }
-}
 
 void ShellSheet::prompt_save(const char* action_description,
                               const std::function<void(bool)>& proceed) {
@@ -2085,7 +2109,6 @@ void ShellSheet::prompt_save(const char* action_description,
 }
 
 void ShellSheet::update_window_title() {
-    auto [build_num, version_str] = get_version_info();
     std::string title = "Shell Sheet";
     if (m_is_modified) title += " *";
     if (m_is_command_running) title += " — Running";

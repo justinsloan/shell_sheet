@@ -78,6 +78,8 @@ genuinely need GTK, such as `TextMark` gravity and font metrics.
 
 ## Keyboard
 
+Also available in the app: **Help ▸ Keyboard Shortcuts** (F1).
+
 | | |
 |---|---|
 | **Ctrl+Enter** | Run the current line (or selection) |
